@@ -1,0 +1,19 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/Player.gd" id="1_knl2q"]
+
+[node name="Player" type="CharacterBody2D"]
+script = ExtResource("1_knl2q")
+
+[node name="Body" type="Polygon2D" parent="."]
+color = Color(0.286275, 0.756863, 0.498039, 1)
+polygon = PackedVector2Array(-18, -18, 18, -18, 18, 18, -18, 18)
+
+[node name="StatusLabel" type="Label" parent="."]
+offset_left = -40.0
+offset_top = -44.0
+offset_right = 40.0
+offset_bottom = -18.0
+horizontal_alignment = 1
+theme_override_colors/font_color = Color(0.898039, 0.976471, 0.929412, 1)
+text = ""

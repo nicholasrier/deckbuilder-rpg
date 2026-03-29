@@ -1,0 +1,68 @@
+[gd_scene load_steps=4 format=3]
+
+[ext_resource type="Script" path="res://scripts/Game.gd" id="1_h0f4x"]
+[ext_resource type="PackedScene" path="res://scenes/Player.tscn" id="2_3pg8c"]
+[ext_resource type="PackedScene" path="res://scenes/Enemy.tscn" id="3_71pi1"]
+
+[node name="Main" type="Node2D"]
+script = ExtResource("1_h0f4x")
+
+[node name="Camera2D" type="Camera2D" parent="."]
+position = Vector2(240, 176)
+enabled = true
+
+[node name="Player" parent="." instance=ExtResource("2_3pg8c")]
+
+[node name="Enemy" parent="." instance=ExtResource("3_71pi1")]
+
+[node name="CanvasLayer" type="CanvasLayer" parent="."]
+
+[node name="HUD" type="MarginContainer" parent="CanvasLayer"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 16.0
+offset_top = 16.0
+offset_right = -16.0
+offset_bottom = -16.0
+
+[node name="Root" type="VBoxContainer" parent="CanvasLayer/HUD"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_right = 0.0
+offset_bottom = 0.0
+theme_override_constants/separation = 12
+
+[node name="TopBar" type="HBoxContainer" parent="CanvasLayer/HUD/Root"]
+theme_override_constants/separation = 24
+
+[node name="StatsLabel" type="Label" parent="CanvasLayer/HUD/Root/TopBar"]
+text = "HP 0/0  Block 0  Energy 0/0"
+
+[node name="ModeLabel" type="Label" parent="CanvasLayer/HUD/Root/TopBar"]
+text = "Mode: Exploration"
+
+[node name="Spacer" type="Control" parent="CanvasLayer/HUD/Root"]
+size_flags_vertical = 3
+
+[node name="CenterMessage" type="Label" parent="CanvasLayer/HUD/Root"]
+horizontal_alignment = 1
+text = "Move with arrow keys or WASD."
+
+[node name="HandPanel" type="PanelContainer" parent="CanvasLayer/HUD/Root"]
+size_flags_horizontal = 3
+
+[node name="HandMargin" type="MarginContainer" parent="CanvasLayer/HUD/Root/HandPanel"]
+theme_override_constants/margin_left = 12
+theme_override_constants/margin_top = 12
+theme_override_constants/margin_right = 12
+theme_override_constants/margin_bottom = 12
+
+[node name="HandBox" type="HBoxContainer" parent="CanvasLayer/HUD/Root/HandPanel/HandMargin"]
+alignment = 1
+theme_override_constants/separation = 8
+
+[node name="ControlsLabel" type="Label" parent="CanvasLayer/HUD/Root"]
+horizontal_alignment = 1
+text = "Arrow keys/WASD move. Number keys play cards. Space ends turn."

@@ -1,0 +1,19 @@
+[gd_scene load_steps=2 format=3 uid="uid://bin2ey3bc42wq"]
+
+[ext_resource type="Script" uid="uid://ch0rw5oprg1mn" path="res://scripts/Enemy.gd" id="1_s1g0x"]
+
+[node name="Enemy" type="CharacterBody2D"]
+script = ExtResource("1_s1g0x")
+
+[node name="Body" type="Polygon2D" parent="."]
+color = Color(0.839216, 0.309804, 0.309804, 1)
+polygon = PackedVector2Array(-18, -18, 18, -18, 18, 18, -18, 18)
+
+[node name="IntentLabel" type="Label" parent="."]
+offset_left = -64.0
+offset_top = -46.0
+offset_right = 64.0
+offset_bottom = -18.0
+theme_override_colors/font_color = Color(1, 0.905882, 0.756863, 1)
+text = "Patrol"
+horizontal_alignment = 1
