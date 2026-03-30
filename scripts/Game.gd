@@ -31,6 +31,19 @@ var movement_left := PLAYER_SPEED
 var must_resolve_overflow := false
 var message := "Move with arrow keys or WASD."
 var enemies := []
+var threatened_tiles := {}
+
+func mark_threat_tile(tile: Vector2i) -> void:
+	threatened_tiles[tile] = true
+
+func clear_threat_tiles() -> void:
+	threatened_tiles.clear()
+
+func is_tile_threatened(tile: Vector2i) -> bool:
+	return threatened_tiles.has(tile)
+
+func is_player_in_threat() -> bool:
+	return is_tile_threatened(player.grid_position)
 
 func _on_enemy_died(theEnemy) -> void:
 	enemies.erase(theEnemy)
@@ -42,6 +55,7 @@ func _ready() -> void:
 	enemies.append(enemy)
 	player.set_grid_position(Vector2i(1, 3))
 	enemy.set_grid_position(Vector2i(6, 3))
+	_build_threat_map()
 	enemy.died.connect(_on_enemy_died)
 	deck_manager.setup(CardDatabaseScript.make_starter_deck())
 	deck_manager.draw_cards(5)
@@ -54,15 +68,18 @@ func _ready() -> void:
 
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, Vector2(GRID_SIZE * TILE_SIZE)), Color(0.109804, 0.117647, 0.14902, 1), true)
+	
 	for x in range(GRID_SIZE.x):
 		for y in range(GRID_SIZE.y):
+			var tile := Vector2i(x, y)
 			var tile_pos := Vector2(x, y) * TILE_SIZE
-			var tint := Color(0.160784, 0.184314, 0.231373, 1)
-			if mode == GameMode.COMBAT and Vector2i(x, y) == enemy.grid_position:
-				tint = Color(0.239216, 0.133333, 0.14902, 1)
-			elif Vector2i(x, y) == player.grid_position and mode == GameMode.COMBAT:
-				tint = Color(0.105882, 0.231373, 0.184314, 1)
-			draw_rect(Rect2(tile_pos + Vector2.ONE * 2, Vector2.ONE * (TILE_SIZE - 4)), tint, true)
+			var tint := get_tile_tint(tile)
+
+			draw_rect(
+				Rect2(tile_pos + Vector2.ONE * 2, Vector2.ONE * (TILE_SIZE - 4)),
+				tint,
+				true
+			)
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -216,6 +233,8 @@ func _enemy_take_turn() -> void:
 		return
 	if _is_adjacent(player.grid_position, enemy.grid_position):
 		player.take_damage(enemy.damage)
+		if player.hiding:
+			player.become_hidden_or_revealed()
 		message = "Enemy attacks for %d." % enemy.damage
 	else:
 		var direction := _step_toward(enemy.grid_position, player.grid_position)
@@ -230,6 +249,7 @@ func _enemy_take_turn() -> void:
 		mode = GameMode.DEFEAT
 		message = "You were overwhelmed."
 	enemy.set_intent_text("Attack %d" % enemy.damage)
+	_build_threat_map()
 	_refresh_ui()
 	queue_redraw()
 
@@ -307,6 +327,7 @@ func _resolve_card(card: Dictionary) -> Dictionary:
 			var old_player_pos: Vector2i = player.grid_position
 			player.set_grid_position(enemy.grid_position)
 			enemy.set_grid_position(old_player_pos)
+			_build_threat_map()
 			return {"success": true, "message": "Swapped positions."}
 		"unseen":
 			player.become_hidden_or_revealed()
@@ -404,6 +425,32 @@ func _is_in_bounds(tile: Vector2i) -> bool:
 	return tile.x >= 0 and tile.y >= 0 and tile.x < GRID_SIZE.x and tile.y < GRID_SIZE.y
 
 
+func _build_threat_map() -> void:
+	threatened_tiles.clear()
+
+	for e in enemies:
+		if e == null or !is_instance_valid(e):
+			continue
+
+		for tile in e.get_threatened_tiles():
+			threatened_tiles[tile] = true
+
+	queue_redraw()
+
+func get_tile_tint(tile: Vector2i) -> Color:
+	var tint := Color(0.160784, 0.184314, 0.231373, 1)
+
+	if threatened_tiles.has(tile):
+		tint = tint.lerp(Color(1, 0, 0, 1), 0.25)
+
+	if mode == GameMode.COMBAT:
+		if tile == enemy.grid_position:
+			return Color(0.239216, 0.133333, 0.14902, 1)
+		elif tile == player.grid_position:
+			return Color(0.105882, 0.231373, 0.184314, 1)
+
+	return tint
+
 func _is_adjacent(a: Vector2i, b: Vector2i) -> bool:
 	return abs(a.x - b.x) + abs(a.y - b.y) == 1
 
@@ -416,4 +463,6 @@ func _step_toward(from_tile: Vector2i, to_tile: Vector2i) -> Vector2i:
 		return Vector2i(0, int(sign(delta.y)))
 	if delta.x != 0:
 		return Vector2i(int(sign(delta.x)), 0)
+	
 	return Vector2i.ZERO
+	

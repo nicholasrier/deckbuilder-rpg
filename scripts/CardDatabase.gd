@@ -49,7 +49,7 @@ const CARDS := {
 		"id": "unseen",
 		"name": "Unseen",
 		"cost": 1,
-		"text": "Your next attack deals 50% more damage.",
+		"text": "Become hidden. Your next attack deals 50% more damage.",
 		"combat_only": false
 	}
 }

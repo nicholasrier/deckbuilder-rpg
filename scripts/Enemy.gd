@@ -14,12 +14,25 @@ enum State {
 	DEFEATED	
 }
 var state := State.ALIVE
+var threat_offsets: Array[Vector2i] = []
 
+func _ready() -> void:
+	threat_offsets = [
+		Vector2i(0, 1),
+		Vector2i(1, 0),
+		Vector2i(0, -1),
+		Vector2i(-1, 0)
+	]
 
 func set_grid_position(value: Vector2i) -> void:
 	grid_position = value
 	position = Vector2(grid_position * TILE_SIZE) + Vector2(TILE_SIZE / 2, TILE_SIZE / 2)
 
+func get_threatened_tiles() -> Array[Vector2i]:
+	var tiles: Array[Vector2i] = []
+	for offset in threat_offsets:
+		tiles.append(grid_position + offset)
+	return tiles
 
 func set_intent_text(value: String) -> void:
 	_intent_label.text = value

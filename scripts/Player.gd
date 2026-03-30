@@ -31,7 +31,6 @@ func become_hidden_or_revealed() -> void:
 
 func take_damage(amount: int) -> void:
 	var remaining := amount
-	become_hidden_or_revealed()
 	if block > 0:
 		var blocked: int = min(block, remaining)
 		block -= blocked
