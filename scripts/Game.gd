@@ -191,6 +191,7 @@ func _begin_player_turn(draw_card: bool = true) -> void:
 	must_resolve_overflow = deck_manager.hand.size() > 5
 	if must_resolve_overflow:
 		message = "Hand overflow. Play or discard one card."
+	
 	_update_enemy_intent()
 	_refresh_ui()
 	queue_redraw()
@@ -308,13 +309,14 @@ func _resolve_card(card: Dictionary) -> Dictionary:
 			enemy.set_grid_position(old_player_pos)
 			return {"success": true, "message": "Swapped positions."}
 		"unseen":
-			player.gain_invisible_charge(1)
+			player.become_hidden_or_revealed()
 			return {"success": true, "message": "Your next attack is empowered."}
 	return {"success": false, "message": "Card effect not implemented."}
 
 
 func _modify_attack_damage(base_damage: int) -> int:
-	if player.consume_invisible_bonus():
+	if player.hiding:
+		player.become_hidden_or_revealed()
 		return int(ceil(base_damage * 1.5))
 	return base_damage
 
