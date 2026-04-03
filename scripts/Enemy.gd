@@ -1,4 +1,5 @@
 extends CharacterBody2D
+class_name Enemy
 
 const TILE_SIZE := 48
 
@@ -26,7 +27,9 @@ func _ready() -> void:
 
 func set_grid_position(value: Vector2i) -> void:
 	grid_position = value
+	@warning_ignore("integer_division")
 	position = Vector2(grid_position * TILE_SIZE) + Vector2(TILE_SIZE / 2, TILE_SIZE / 2)
+	moved.emit(self)
 
 func get_threatened_tiles() -> Array[Vector2i]:
 	var tiles: Array[Vector2i] = []
@@ -35,8 +38,10 @@ func get_threatened_tiles() -> Array[Vector2i]:
 	return tiles
 
 func set_intent_text(value: String) -> void:
+	if _intent_label.text == value:
+		return
 	_intent_label.text = value
-
+	intent_changed.emit(self, _intent_label.text)
 
 func take_damage(amount: int) -> void:
 	hp = max(hp - amount, 0)
@@ -44,6 +49,8 @@ func take_damage(amount: int) -> void:
 		die()
 
 signal died(enemy)
+signal moved(enemy)
+signal intent_changed(enemy, new_intent)
 
 func die() -> void:
 	if state == State.DEFEATED:
@@ -51,4 +58,6 @@ func die() -> void:
 	
 	state = State.DEFEATED
 	died.emit(self)
+
+	
 	

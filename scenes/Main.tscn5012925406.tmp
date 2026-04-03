@@ -13,6 +13,8 @@ position = Vector2(240, 176)
 
 [node name="Player" parent="." instance=ExtResource("2_3pg8c")]
 
+[node name="Enemy" parent="." instance=ExtResource("3_71pi1")]
+
 [node name="CanvasLayer" type="CanvasLayer" parent="."]
 
 [node name="HUD" type="MarginContainer" parent="CanvasLayer"]
