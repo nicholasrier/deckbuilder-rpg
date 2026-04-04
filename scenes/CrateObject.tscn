@@ -1,0 +1,14 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/CrateObject.gd" id="1_1k8ud"]
+
+[node name="CrateObject" type="Node2D"]
+script = ExtResource("1_1k8ud")
+
+[node name="Body" type="Polygon2D" parent="."]
+color = Color(0.654902, 0.482353, 0.247059, 1)
+polygon = PackedVector2Array(-16, -16, 16, -16, 16, 16, -16, 16)
+
+[node name="Band" type="Polygon2D" parent="."]
+color = Color(0.341176, 0.223529, 0.121569, 1)
+polygon = PackedVector2Array(-4, -16, 4, -16, 4, 16, -4, 16)

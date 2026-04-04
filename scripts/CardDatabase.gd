@@ -15,7 +15,7 @@ const CARDS := {
 		"name": "Strike",
 		"cost": 1,
 		"text": "Deal 6 damage to an adjacent enemy.",
-		"combat_only": true
+		"combat_only": false
 	},
 	"block": {
 		"id": "block",

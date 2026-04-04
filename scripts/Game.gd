@@ -4,8 +4,27 @@ const TILE_SIZE := 48
 const GRID_SIZE := Vector2i(10, 7)
 const PLAYER_SPEED := 3
 
+const TERRAIN_DEFS := {
+	"floor": {
+		"blocks_movement": false,
+		"blocks_vision": false
+	},
+	"wall": {
+		"blocks_movement": true,
+		"blocks_vision": true
+	}
+}
+
+const HAZARD_DEFS := {
+	"fire": {
+		"enter_damage": 2,
+		"end_turn_damage": 1
+	}
+}
+
 const DeckManagerScript := preload("res://scripts/DeckManager.gd")
 const CardDatabaseScript := preload("res://scripts/CardDatabase.gd")
+const CrateObjectScene := preload("res://scenes/CrateObject.tscn")
 
 enum GameMode {
 	EXPLORATION,
@@ -14,7 +33,7 @@ enum GameMode {
 	DEFEAT
 }
 
-@export var EnemyScene: PackedScene 
+@export var EnemyScene: PackedScene
 
 @onready var player = $Player
 
@@ -32,56 +51,84 @@ var max_energy := 3
 var movement_left := PLAYER_SPEED
 var must_resolve_overflow := false
 var message := "Move with arrow keys or WASD."
-var enemies : Array[Enemy] = []
+var enemies: Array[Enemy] = []
 var threatened_tiles := {}
 var current_target: Enemy = null
+var terrain_layer: Dictionary = {}
+var hazard_layer: Dictionary = {}
+var object_layer: Dictionary = {}
+var pending_environment_messages: Array[String] = []
+
 
 func mark_threat_tile(tile: Vector2i) -> void:
 	threatened_tiles[tile] = true
 
+
 func clear_threat_tiles() -> void:
 	threatened_tiles.clear()
+
 
 func is_tile_threatened(tile: Vector2i) -> bool:
 	return threatened_tiles.has(tile)
 
+
 func is_player_in_threat() -> bool:
 	return is_tile_threatened(player.grid_position)
+
 
 func _get_nearest_enemy() -> Enemy:
 	var nearest: Enemy = null
 	var best_distance := INF
 
 	for e in enemies:
-		if e == null or !is_instance_valid(e):
+		if e == null or not is_instance_valid(e):
 			continue
 
-		var dist : float = abs(e.grid_position.x - player.grid_position.x) + abs(e.grid_position.y - player.grid_position.y)
+		var dist: float = abs(e.grid_position.x - player.grid_position.x) + abs(e.grid_position.y - player.grid_position.y)
 		if dist < best_distance:
 			best_distance = dist
 			nearest = e
 
 	return nearest
 
-func _on_enemy_died(theEnemy) -> void:
-	if current_target == theEnemy:
+
+func _on_enemy_died(the_enemy: Enemy) -> void:
+	if current_target == the_enemy:
 		current_target = _get_nearest_enemy()
-	
-	enemies.erase(theEnemy)
-	theEnemy.hide()
-	theEnemy.queue_free()
+
+	enemies.erase(the_enemy)
+	the_enemy.hide()
+	the_enemy.queue_free()
 	_build_threat_map(enemies)
 	_check_end_of_combat()
-	
-func _on_enemy_moved(theEnemy) -> void:
-	_build_threat_map([theEnemy])
+
+
+func _on_enemy_moved(the_enemy: Enemy) -> void:
+	_build_threat_map(enemies)
 	queue_redraw()
 
-func _on_enemy_intent_changed() -> void:
+
+func _on_enemy_intent_changed(_enemy: Enemy, _new_intent: String) -> void:
 	queue_redraw()
+
+
+func _on_environment_object_destroyed(obj) -> void:
+	if obj == null:
+		return
+
+	var object_tile: Vector2i = obj.grid_position
+	if object_layer.get(object_tile) == obj:
+		object_layer.erase(object_tile)
+
+	pending_environment_messages.append("%s was destroyed." % _object_display_name(obj))
+	obj.hide()
+	obj.queue_free()
+	queue_redraw()
+
 
 func _ready() -> void:
 	_setup_input_map()
+	_setup_environment_layers()
 	_spawn_enemy(EnemyScene, Vector2i(6, 3))
 	_spawn_enemy(EnemyScene, Vector2i(6, 1))
 	player.set_grid_position(Vector2i(1, 3))
@@ -90,15 +137,34 @@ func _ready() -> void:
 	deck_manager.setup(CardDatabaseScript.make_starter_deck())
 	deck_manager.draw_cards(5)
 	current_energy = max_energy
-	
+
 	_update_message()
 	_refresh_ui()
 	queue_redraw()
 
 
+func _setup_environment_layers() -> void:
+	terrain_layer.clear()
+	hazard_layer.clear()
+
+	for tile in object_layer.keys():
+		remove_object_at(tile)
+	object_layer.clear()
+
+	_set_terrain(Vector2i(4, 2), "wall")
+	_set_terrain(Vector2i(4, 3), "wall")
+	_set_terrain(Vector2i(4, 4), "wall")
+
+	_set_hazard(Vector2i(2, 1), "fire")
+	_set_hazard(Vector2i(7, 5), "fire")
+
+	var crate := CrateObjectScene.instantiate()
+	add_object(crate, Vector2i(3, 5))
+
+
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, Vector2(GRID_SIZE * TILE_SIZE)), Color(0.109804, 0.117647, 0.14902, 1), true)
-	
+
 	for x in range(GRID_SIZE.x):
 		for y in range(GRID_SIZE.y):
 			var tile := Vector2i(x, y)
@@ -110,13 +176,40 @@ func _draw() -> void:
 				tint,
 				true
 			)
+			_draw_tile_overlay(tile, tile_pos)
+
 	for e in enemies:
-		if e == null or !is_instance_valid(e):
+		if e == null or not is_instance_valid(e):
 			continue
 
 		if e == current_target:
 			var top_left := Vector2(e.grid_position * TILE_SIZE)
 			draw_rect(Rect2(top_left, Vector2(TILE_SIZE, TILE_SIZE)), Color(1, 1, 0, 0.25), false, 2.0)
+
+
+func _draw_tile_overlay(tile: Vector2i, tile_pos: Vector2) -> void:
+	if get_terrain_type(tile) == "wall":
+		draw_rect(
+			Rect2(tile_pos + Vector2.ONE * 8, Vector2.ONE * (TILE_SIZE - 16)),
+			Color(0.458824, 0.47451, 0.545098, 1),
+			true
+		)
+		draw_line(tile_pos + Vector2(10, 10), tile_pos + Vector2(TILE_SIZE - 10, TILE_SIZE - 10), Color(0.831373, 0.85098, 0.898039, 0.75), 3.0)
+		draw_line(tile_pos + Vector2(TILE_SIZE - 10, 10), tile_pos + Vector2(10, TILE_SIZE - 10), Color(0.831373, 0.85098, 0.898039, 0.75), 3.0)
+
+	var hazard := get_hazard_at(tile)
+	if String(hazard.get("type", "")) == "fire":
+		draw_rect(
+			Rect2(tile_pos + Vector2(14, 18), Vector2(20, 16)),
+			Color(0.917647, 0.384314, 0.180392, 0.95),
+			true
+		)
+		draw_rect(
+			Rect2(tile_pos + Vector2(18, 10), Vector2(12, 14)),
+			Color(1, 0.729412, 0.270588, 0.95),
+			true
+		)
+
 
 func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> void:
 	var e := scene.instantiate() as Enemy
@@ -127,10 +220,11 @@ func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> void:
 	add_child(e)
 	enemies.append(e)
 
+
 func _input(event: InputEvent) -> void:
 	if mode != GameMode.COMBAT:
 		return
-	
+
 	if event is InputEventMouseButton \
 	and event.button_index == MOUSE_BUTTON_LEFT \
 	and event.pressed:
@@ -138,7 +232,8 @@ func _input(event: InputEvent) -> void:
 		var clicked_enemy := _get_enemy_at_world_pos(world_pos)
 		if clicked_enemy != null:
 			current_target = clicked_enemy
-			queue_redraw() # if your target highlight is drawn manually
+			queue_redraw()
+
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event.is_action_pressed("end_turn"):
@@ -156,23 +251,110 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif event.is_action_pressed("card_5"):
 		_handle_card_shortcut(4)
 
+
 func _world_to_grid(world_pos: Vector2) -> Vector2i:
 	return Vector2i(world_pos / TILE_SIZE)
+
 
 func _get_enemy_at_world_pos(world_pos: Vector2) -> Enemy:
 	var grid_pos := _world_to_grid(world_pos)
 	return get_enemy_at(grid_pos)
 
+
 func get_enemy_at(tile: Vector2i) -> Enemy:
 	for e in enemies:
-		if e == null or !is_instance_valid(e):
+		if e == null or not is_instance_valid(e):
 			continue
 		if e.grid_position == tile:
 			return e
 	return null
 
-func _process(_delta: float) -> void:
 
+func get_terrain_type(tile: Vector2i) -> String:
+	var terrain_data: Dictionary = terrain_layer.get(tile, {})
+	return String(terrain_data.get("type", "floor"))
+
+
+func terrain_blocks_movement(tile: Vector2i) -> bool:
+	var terrain_type := get_terrain_type(tile)
+	var terrain_def: Dictionary = TERRAIN_DEFS.get(terrain_type, TERRAIN_DEFS["floor"])
+	return bool(terrain_def.get("blocks_movement", false))
+
+
+func terrain_blocks_vision(tile: Vector2i) -> bool:
+	var terrain_type := get_terrain_type(tile)
+	var terrain_def: Dictionary = TERRAIN_DEFS.get(terrain_type, TERRAIN_DEFS["floor"])
+	return bool(terrain_def.get("blocks_vision", false))
+
+
+func _set_terrain(tile: Vector2i, terrain_type: String) -> void:
+	if terrain_type == "floor":
+		terrain_layer.erase(tile)
+		return
+	terrain_layer[tile] = {"type": terrain_type}
+
+
+func _set_hazard(tile: Vector2i, hazard_type: String, duration: int = -1) -> void:
+	var hazard_data := {"type": hazard_type}
+	if duration > 0:
+		hazard_data["duration"] = duration
+	hazard_layer[tile] = hazard_data
+
+
+func get_hazard_at(tile: Vector2i) -> Dictionary:
+	return hazard_layer.get(tile, {})
+
+
+func get_object_at(tile: Vector2i):
+	var obj = object_layer.get(tile, null)
+	if obj == null:
+		return null
+	if not is_instance_valid(obj):
+		object_layer.erase(tile)
+		return null
+	return obj
+
+
+func add_object(obj, tile: Vector2i) -> void:
+	if obj == null:
+		return
+
+	var existing = get_object_at(tile)
+	if existing != null and existing != obj:
+		remove_object_at(tile)
+
+	if obj.has_signal("destroyed") and not obj.destroyed.is_connected(_on_environment_object_destroyed):
+		obj.destroyed.connect(_on_environment_object_destroyed)
+
+	if obj.get_parent() != self:
+		add_child(obj)
+
+	obj.set_grid_position(tile)
+	object_layer[tile] = obj
+	queue_redraw()
+
+
+func remove_object_at(tile: Vector2i) -> void:
+	var obj = get_object_at(tile)
+	if obj == null:
+		object_layer.erase(tile)
+		return
+
+	object_layer.erase(tile)
+	obj.hide()
+	obj.queue_free()
+	queue_redraw()
+
+
+func damage_object_at(tile: Vector2i, amount: int) -> void:
+	var obj = get_object_at(tile)
+	if obj == null:
+		return
+	if obj.has_method("take_damage"):
+		obj.take_damage(amount)
+
+
+func _process(_delta: float) -> void:
 	var move_dir := _read_move_input()
 	if move_dir == Vector2i.ZERO:
 		return
@@ -230,28 +412,60 @@ func _read_move_input() -> Vector2i:
 
 func _try_exploration_move(direction: Vector2i) -> void:
 	var target: Vector2i = player.grid_position + direction
-	if not _is_in_bounds(target):
+	if not _move_entity_to_tile(player, target):
 		return
-	player.set_grid_position(target)
-	if !enemies.is_empty():
+
+	_apply_on_enter_tile_effects(player, target)
+	if player.hp <= 0:
+		_finish_environment_message("You were overwhelmed.")
+		mode = GameMode.DEFEAT
+		_refresh_ui()
+		queue_redraw()
+		return
+
+	if not enemies.is_empty():
 		if is_player_in_threat():
+			_finish_environment_message("")
 			_start_combat()
-		else:
-			message = "Exploration: close the gap to trigger combat."
-	
+			return
+		message = _consume_environment_messages("Exploration: close the gap to trigger combat.")
+
 	_update_message()
 	queue_redraw()
 
-func _is_tile_occupied(tile: Vector2i) -> bool:
-	if player.grid_position == tile:
+
+func _is_entity_occupied(tile: Vector2i, ignore_entity = null) -> bool:
+	if player != ignore_entity and player.grid_position == tile:
 		return true
-	
+
 	for e in enemies:
+		if e == null or not is_instance_valid(e) or e == ignore_entity:
+			continue
 		if e.grid_position == tile:
 			return true
-	#add logic for walls and environment later
-	
+
 	return false
+
+
+func _can_move_to_tile(tile: Vector2i, moving_entity = null) -> bool:
+	if not _is_in_bounds(tile):
+		return false
+	if terrain_blocks_movement(tile):
+		return false
+
+	var obj = get_object_at(tile)
+	if obj != null and bool(obj.blocks_movement):
+		return false
+
+	return not _is_entity_occupied(tile, moving_entity)
+
+
+func _move_entity_to_tile(entity, target: Vector2i) -> bool:
+	if not _can_move_to_tile(target, entity):
+		return false
+	entity.set_grid_position(target)
+	return true
+
 
 func _try_combat_move(direction: Vector2i) -> void:
 	if must_resolve_overflow:
@@ -262,13 +476,15 @@ func _try_combat_move(direction: Vector2i) -> void:
 		message = "No movement left this turn."
 		_update_message()
 		return
+
 	var target: Vector2i = player.grid_position + direction
-	if not _is_in_bounds(target) or _is_tile_occupied(target):
+	if not _move_entity_to_tile(player, target):
 		return
-	player.set_grid_position(target)
+
 	current_energy -= 1
 	movement_left -= 1
-	message = "Moved to %s." % [str(player.grid_position)]
+	_apply_on_enter_tile_effects(player, target)
+	message = _consume_environment_messages("Moved to %s." % [str(player.grid_position)])
 	_update_all_enemy_intent()
 	_refresh_ui()
 	queue_redraw()
@@ -291,19 +507,28 @@ func _begin_player_turn(draw_card: bool = true) -> void:
 	must_resolve_overflow = deck_manager.hand.size() > 5
 	if must_resolve_overflow:
 		message = "Hand overflow. Play or discard one card."
-	
+
 	_update_all_enemy_intent()
 	_refresh_ui()
 	queue_redraw()
 
 
 func _end_player_turn() -> void:
-	message = "Enemy turn."
+	_apply_end_turn_tile_effects(player)
+	if player.hp <= 0:
+		mode = GameMode.DEFEAT
+		message = _consume_environment_messages("You were overwhelmed.")
+		_refresh_ui()
+		queue_redraw()
+		return
+
+	message = _consume_environment_messages("Enemy turn.")
 	_enemy_take_turn()
 	if mode != GameMode.COMBAT:
 		_refresh_ui()
 		queue_redraw()
 		return
+
 	combat_turn += 1
 	_begin_player_turn(true)
 	if not must_resolve_overflow:
@@ -312,10 +537,10 @@ func _end_player_turn() -> void:
 
 
 func _enemy_take_turn() -> void:
-	for e in enemies:
-		if e.hp <= 0:
-			return	
-	
+	for e in enemies.duplicate():
+		if e == null or not is_instance_valid(e):
+			continue
+
 		if player.grid_position in e.get_threatened_tiles():
 			player.take_damage(e.damage)
 			if player.hiding:
@@ -323,17 +548,32 @@ func _enemy_take_turn() -> void:
 			message = "Enemy attacks for %d." % e.damage
 		else:
 			var direction := _step_toward(e.grid_position, player.grid_position)
-			if direction != Vector2i.ZERO:
-				e.facing_dir = direction
-				e.set_grid_position(e.grid_position + direction)
+			if direction != Vector2i.ZERO and _move_entity_to_tile(e, e.grid_position + direction):
 				message = "Enemy advances."
-			if player.grid_position in e.get_threatened_tiles():
+				_apply_on_enter_tile_effects(e, e.grid_position)
+				message = _consume_environment_messages(message)
+			if e != null and is_instance_valid(e) and player.grid_position in e.get_threatened_tiles():
 				player.take_damage(e.damage)
 				message += " Then hits for %d." % e.damage
+
+		if e == null or not is_instance_valid(e):
+			_refresh_ui()
+			queue_redraw()
+			continue
+
+		_apply_end_turn_tile_effects(e)
+		message = _consume_environment_messages(message)
+
 		if player.hp <= 0:
 			mode = GameMode.DEFEAT
 			message = "You were overwhelmed."
-		_update_enemy_intent(e)
+		if mode != GameMode.COMBAT:
+			_refresh_ui()
+			queue_redraw()
+			return
+
+		if e != null and is_instance_valid(e):
+			_update_enemy_intent(e)
 		_refresh_ui()
 		queue_redraw()
 
@@ -363,19 +603,22 @@ func _play_card(index: int) -> void:
 		message = "Not enough energy for %s." % card["name"]
 		_update_message()
 		return
+
 	var result := _resolve_card(card)
 	if not result["success"]:
 		message = result["message"]
 		_update_message()
 		return
+
 	current_energy -= int(card["cost"])
 	var played := deck_manager.play_from_hand(index)
 	message = "Played %s. %s" % [played["name"], result["message"]]
-	
+
 	_update_all_enemy_intent()
 	_check_end_of_combat()
 	_refresh_ui()
 	queue_redraw()
+
 
 func _resolve_card(card: Dictionary) -> Dictionary:
 	match card["id"]:
@@ -391,30 +634,44 @@ func _resolve_card(card: Dictionary) -> Dictionary:
 			return _play_slip_past()
 		"unseen":
 			return _play_unseen()
-		_: return {"success": false, "message": "Card effect not implemented."}
+		_:
+			return {"success": false, "message": "Card effect not implemented."}
+
 
 func _play_strike() -> Dictionary:
+	if not _has_valid_target():
+		return {"success": false, "message": "No target selected."}
 	if not _is_adjacent(player.grid_position, current_target.grid_position):
 		return {"success": false, "message": "Strike needs an adjacent enemy."}
 	var damage := _modify_attack_damage(6)
 	current_target.take_damage(damage)
 	return {"success": true, "message": "Dealt %d damage." % damage}
 
+
 func _play_block() -> Dictionary:
 	player.gain_block(5)
-	return {"success": true, "message": "Gained 5 block."} 
-	
+	return {"success": true, "message": "Gained 5 block."}
+
+
 func _play_lunge() -> Dictionary:
+	if not _has_valid_target():
+		return {"success": false, "message": "No target selected."}
+
 	var direction := _step_toward(player.grid_position, current_target.grid_position)
-	if direction != Vector2i.ZERO and player.grid_position + direction != current_target.grid_position:
-		player.set_grid_position(player.grid_position + direction)
+	if direction != Vector2i.ZERO:
+		var lunge_tile: Vector2i = player.grid_position + direction
+		if lunge_tile != current_target.grid_position and _move_entity_to_tile(player, lunge_tile):
+			_apply_on_enter_tile_effects(player, lunge_tile)
 	if _is_adjacent(player.grid_position, current_target.grid_position):
 		var lunge_damage := _modify_attack_damage(6)
 		current_target.take_damage(lunge_damage)
-		return {"success": true, "message": "Closed in and dealt %d damage." % lunge_damage}
-	return {"success": true, "message": "Moved closer, but no hit."}
-	
+		return {"success": true, "message": _consume_environment_messages("Closed in and dealt %d damage." % lunge_damage)}
+	return {"success": true, "message": _consume_environment_messages("Moved closer, but no hit.")}
+
+
 func _play_backstab() -> Dictionary:
+	if not _has_valid_target():
+		return {"success": false, "message": "No target selected."}
 	if not _is_adjacent(player.grid_position, current_target.grid_position):
 		return {"success": false, "message": "Backstab needs an adjacent enemy."}
 	var behind_tile: Vector2i = current_target.grid_position - current_target.facing_dir
@@ -422,18 +679,29 @@ func _play_backstab() -> Dictionary:
 	var backstab_damage := _modify_attack_damage(base_damage)
 	current_target.take_damage(backstab_damage)
 	return {"success": true, "message": "Dealt %d damage." % backstab_damage}
-	
+
+
 func _play_slip_past() -> Dictionary:
+	if not _has_valid_target():
+		return {"success": false, "message": "No target selected."}
 	if not _is_adjacent(player.grid_position, current_target.grid_position):
 		return {"success": false, "message": "Slip Past needs an adjacent enemy."}
 	var old_player_pos: Vector2i = player.grid_position
 	player.set_grid_position(current_target.grid_position)
 	current_target.set_grid_position(old_player_pos)
-	return {"success": true, "message": "Swapped positions."}
-	
+	_apply_on_enter_tile_effects(player, player.grid_position)
+	_apply_on_enter_tile_effects(current_target, current_target.grid_position)
+	return {"success": true, "message": _consume_environment_messages("Swapped positions.")}
+
+
 func _play_unseen() -> Dictionary:
 	player.become_hidden_or_revealed()
 	return {"success": true, "message": "Your next attack is empowered."}
+
+
+func _has_valid_target() -> bool:
+	return current_target != null and is_instance_valid(current_target)
+
 
 func _modify_attack_damage(base_damage: int) -> int:
 	if player.hiding:
@@ -443,11 +711,12 @@ func _modify_attack_damage(base_damage: int) -> int:
 
 
 func _check_end_of_combat() -> void:
-	if !enemies.is_empty():
+	if not enemies.is_empty():
 		return
 	mode = GameMode.EXPLORATION
-	message = " "
+	message = _consume_environment_messages("")
 	_update_message()
+
 
 func _update_enemy_intent(e: Enemy) -> void:
 	if mode == GameMode.COMBAT:
@@ -458,11 +727,13 @@ func _update_enemy_intent(e: Enemy) -> void:
 	else:
 		e.set_intent_text("Patrol")
 
+
 func _update_all_enemy_intent() -> void:
 	for e in enemies:
-		if e == null or !is_instance_valid(e):
+		if e == null or not is_instance_valid(e):
 			continue
 		_update_enemy_intent(e)
+
 
 func _refresh_ui() -> void:
 	mode_label.text = "Mode: %s" % _mode_name()
@@ -522,17 +793,18 @@ func _mode_name() -> String:
 			return "Victory"
 		GameMode.DEFEAT:
 			return "Defeat"
-	return "Unknocwn"
+	return "Unknown"
 
 
 func _is_in_bounds(tile: Vector2i) -> bool:
 	return tile.x >= 0 and tile.y >= 0 and tile.x < GRID_SIZE.x and tile.y < GRID_SIZE.y
 
+
 func _build_threat_map(foes: Array[Enemy]) -> void:
 	threatened_tiles.clear()
-	
+
 	for f in foes:
-		if f == null or !is_instance_valid(f):
+		if f == null or not is_instance_valid(f):
 			continue
 
 		for tile in f.get_threatened_tiles():
@@ -540,20 +812,101 @@ func _build_threat_map(foes: Array[Enemy]) -> void:
 
 	queue_redraw()
 
+
 func get_tile_tint(tile: Vector2i) -> Color:
+	if get_terrain_type(tile) == "wall":
+		return Color(0.243137, 0.262745, 0.313726, 1)
+
 	var tint := Color(0.160784, 0.184314, 0.231373, 1)
 
 	if threatened_tiles.has(tile):
 		tint = tint.lerp(Color(1, 0, 0, 1), 0.25)
 
-	if mode == GameMode.COMBAT:
-		for e in enemies:
-			if tile == e.grid_position:
-				return Color(0.239216, 0.133333, 0.14902, 1)
-	elif tile == player.grid_position:
-		return Color(0.105882, 0.231373, 0.184314, 1)
+	if tile == player.grid_position:
+		tint = tint.lerp(Color(0.105882, 0.231373, 0.184314, 1), 0.55)
+
+	for e in enemies:
+		if e == null or not is_instance_valid(e):
+			continue
+		if tile == e.grid_position:
+			return Color(0.239216, 0.133333, 0.14902, 1)
 
 	return tint
+
+
+func _apply_on_enter_tile_effects(entity, tile: Vector2i) -> void:
+	var hazard := get_hazard_at(tile)
+	if hazard.is_empty():
+		return
+
+	var hazard_type := String(hazard.get("type", ""))
+	var hazard_def: Dictionary = HAZARD_DEFS.get(hazard_type, {})
+	var enter_damage := int(hazard_def.get("enter_damage", 0))
+	if enter_damage <= 0:
+		return
+
+	_damage_entity(entity, enter_damage)
+	pending_environment_messages.append("%s takes %d %s damage." % [_entity_display_name(entity), enter_damage, hazard_type])
+
+
+func _apply_end_turn_tile_effects(entity) -> void:
+	if entity == null or not is_instance_valid(entity):
+		return
+
+	var hazard := get_hazard_at(entity.grid_position)
+	if hazard.is_empty():
+		return
+
+	var hazard_type := String(hazard.get("type", ""))
+	var hazard_def: Dictionary = HAZARD_DEFS.get(hazard_type, {})
+	var end_turn_damage := int(hazard_def.get("end_turn_damage", 0))
+	if end_turn_damage <= 0:
+		return
+
+	_damage_entity(entity, end_turn_damage)
+	pending_environment_messages.append("%s takes %d %s damage at end of turn." % [_entity_display_name(entity), end_turn_damage, hazard_type])
+
+
+func _damage_entity(entity, amount: int) -> void:
+	if entity == null or not is_instance_valid(entity):
+		return
+	if entity.has_method("take_damage"):
+		entity.take_damage(amount)
+	_refresh_ui()
+
+
+func _entity_display_name(entity) -> String:
+	if entity == player:
+		return "Player"
+	if entity is Enemy:
+		return "Enemy"
+	return "Entity"
+
+
+func _object_display_name(obj) -> String:
+	if obj == null:
+		return "Object"
+	var object_type = obj.get("object_type")
+	if object_type != null and String(object_type) != "":
+		return String(object_type).capitalize()
+	return String(obj.name)
+
+
+func _consume_environment_messages(base_message: String) -> String:
+	if pending_environment_messages.is_empty():
+		return base_message
+
+	var environment_text := " ".join(pending_environment_messages)
+	pending_environment_messages.clear()
+	if base_message.is_empty():
+		return environment_text
+	return "%s %s" % [base_message, environment_text]
+
+
+func _finish_environment_message(base_message: String) -> void:
+	message = _consume_environment_messages(base_message)
+	_update_message()
+
 
 func _is_adjacent(a: Vector2i, b: Vector2i) -> bool:
 	return abs(a.x - b.x) + abs(a.y - b.y) == 1
@@ -567,6 +920,5 @@ func _step_toward(from_tile: Vector2i, to_tile: Vector2i) -> Vector2i:
 		return Vector2i(0, int(sign(delta.y)))
 	if delta.x != 0:
 		return Vector2i(int(sign(delta.x)), 0)
-	
+
 	return Vector2i.ZERO
-	
