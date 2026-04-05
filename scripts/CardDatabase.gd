@@ -29,7 +29,7 @@ const CARDS := {
 		"name": "Lunge",
 		"cost": 1,
 		"text": "Move 1 tile toward the enemy, then deal 6 damage if adjacent.",
-		"combat_only": true
+		"combat_only": false
 	},
 	"backstab": {
 		"id": "backstab",

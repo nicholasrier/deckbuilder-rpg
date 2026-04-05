@@ -52,8 +52,9 @@ var movement_left := PLAYER_SPEED
 var must_resolve_overflow := false
 var message := "Move with arrow keys or WASD."
 var enemies: Array[Enemy] = []
+@export var targets: Array[Node2D] = []
 var threatened_tiles := {}
-var current_target: Enemy = null
+@export var current_target: Node2D = null
 var terrain_layer: Dictionary = {}
 var hazard_layer: Dictionary = {}
 var object_layer: Dictionary = {}
@@ -93,7 +94,7 @@ func _get_nearest_enemy() -> Enemy:
 
 
 func _on_enemy_died(the_enemy: Enemy) -> void:
-	if current_target == the_enemy:
+	if current_target == the_enemy and mode == GameMode.COMBAT:
 		current_target = _get_nearest_enemy()
 
 	enemies.erase(the_enemy)
@@ -137,7 +138,8 @@ func _ready() -> void:
 	deck_manager.setup(CardDatabaseScript.make_starter_deck())
 	deck_manager.draw_cards(5)
 	current_energy = max_energy
-
+	
+	
 	_update_message()
 	_refresh_ui()
 	queue_redraw()
@@ -178,12 +180,15 @@ func _draw() -> void:
 			)
 			_draw_tile_overlay(tile, tile_pos)
 
-	for e in enemies:
-		if e == null or not is_instance_valid(e):
+	for t in targets:
+		if current_target != null and not is_instance_valid(current_target):
+			current_target = null
+		
+		if t == null or not is_instance_valid(t):
 			continue
 
-		if e == current_target:
-			var top_left := Vector2(e.grid_position * TILE_SIZE)
+		if t == current_target:
+			var top_left := Vector2(t.grid_position * TILE_SIZE)
 			draw_rect(Rect2(top_left, Vector2(TILE_SIZE, TILE_SIZE)), Color(1, 1, 0, 0.25), false, 2.0)
 
 
@@ -219,19 +224,19 @@ func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> void:
 	e.intent_changed.connect(_on_enemy_intent_changed)
 	add_child(e)
 	enemies.append(e)
-
+	targets.append(e)
 
 func _input(event: InputEvent) -> void:
-	if mode != GameMode.COMBAT:
-		return
+	#if mode != GameMode.COMBAT:
+		#return
 
 	if event is InputEventMouseButton \
 	and event.button_index == MOUSE_BUTTON_LEFT \
 	and event.pressed:
 		var world_pos := get_global_mouse_position()
-		var clicked_enemy := _get_enemy_at_world_pos(world_pos)
-		if clicked_enemy != null:
-			current_target = clicked_enemy
+		var clicked_targetable: Node2D = _get_targetable_at_world_pos(world_pos)
+		if clicked_targetable != null:
+			current_target = clicked_targetable
 			queue_redraw()
 
 
@@ -256,9 +261,9 @@ func _world_to_grid(world_pos: Vector2) -> Vector2i:
 	return Vector2i(world_pos / TILE_SIZE)
 
 
-func _get_enemy_at_world_pos(world_pos: Vector2) -> Enemy:
+func _get_targetable_at_world_pos(world_pos: Vector2):
 	var grid_pos := _world_to_grid(world_pos)
-	return get_enemy_at(grid_pos)
+	return get_targetable_at(grid_pos)
 
 
 func get_enemy_at(tile: Vector2i) -> Enemy:
@@ -269,6 +274,15 @@ func get_enemy_at(tile: Vector2i) -> Enemy:
 			return e
 	return null
 
+func get_targetable_at(tile: Vector2i):
+	var enemy = get_enemy_at(tile)
+	if enemy != null:
+		return enemy
+	
+	var obj = get_object_at(tile)
+	if obj != null and obj.is_targetable:
+		return obj
+	return null
 
 func get_terrain_type(tile: Vector2i) -> String:
 	var terrain_data: Dictionary = terrain_layer.get(tile, {})
@@ -331,15 +345,22 @@ func add_object(obj, tile: Vector2i) -> void:
 
 	obj.set_grid_position(tile)
 	object_layer[tile] = obj
+	if obj.is_targetable:
+		targets.append(obj)
 	queue_redraw()
 
+func _resolve_targeting(destroyed_target: Node2D) -> void:
+	if destroyed_target == current_target:
+		current_target == null
+	queue_redraw()
 
 func remove_object_at(tile: Vector2i) -> void:
 	var obj = get_object_at(tile)
+	_resolve_targeting(obj)
 	if obj == null:
 		object_layer.erase(tile)
 		return
-
+	
 	object_layer.erase(tile)
 	obj.hide()
 	obj.queue_free()

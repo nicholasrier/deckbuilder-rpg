@@ -7,5 +7,5 @@ func _ready() -> void:
 	blocks_movement = true
 	max_hp = 4
 	hp = max_hp
-	destructible = true
-	targetable = true
+	is_destructible = true
+	is_targetable = true

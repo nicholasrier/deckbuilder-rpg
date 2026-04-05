@@ -1,4 +1,5 @@
 extends CharacterBody2D
+
 class_name Enemy
 
 const TILE_SIZE := 48
