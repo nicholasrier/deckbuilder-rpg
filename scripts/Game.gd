@@ -3,6 +3,12 @@ extends Node2D
 const TILE_SIZE := 48
 const GRID_SIZE := Vector2i(10, 7)
 const PLAYER_SPEED := 3
+const CARDINAL_DIRECTIONS: Array[Vector2i] = [
+	Vector2i.UP,
+	Vector2i.RIGHT,
+	Vector2i.DOWN,
+	Vector2i.LEFT
+]
 
 const TERRAIN_DEFS := {
 	"floor": {
@@ -35,6 +41,11 @@ enum GameMode {
 }
 
 @export var EnemyScene: PackedScene
+@export var debug_enemy_pathfinding := false
+@export_range(0.0, 0.5, 0.01) var enemy_step_duration := 0.18
+@export var debug_enemy_step_logging := false
+@export_range(0.0, 0.5, 0.01) var player_step_duration := 0.12
+@export var debug_player_step_logging := false
 
 @onready var player = $Player
 
@@ -60,6 +71,8 @@ var terrain_layer: Dictionary = {}
 var hazard_layer: Dictionary = {}
 var object_layer: Dictionary = {}
 var pending_environment_messages: Array[String] = []
+var enemy_turn_in_progress := false
+var player_move_in_progress := false
 
 
 func mark_threat_tile(tile: Vector2i) -> void:
@@ -104,6 +117,7 @@ func _on_enemy_died(the_enemy: Enemy) -> void:
 	_check_end_of_combat()
 
 
+@warning_ignore("unused_parameter")
 func _on_enemy_moved(the_enemy: Enemy) -> void:
 	_build_threat_map(enemies)
 	queue_redraw()
@@ -229,6 +243,9 @@ func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> void:
 	targets.append(e)
 
 func _input(event: InputEvent) -> void:
+	if enemy_turn_in_progress or player_move_in_progress:
+		return
+
 	if event is InputEventMouseButton \
 	and event.button_index == MOUSE_BUTTON_LEFT \
 	and event.pressed:
@@ -257,6 +274,9 @@ func _is_pointer_over_card_ui() -> bool:
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	if enemy_turn_in_progress or player_move_in_progress:
+		return
+
 	if event.is_action_pressed("end_turn"):
 		if mode == GameMode.COMBAT and not must_resolve_overflow:
 			_end_player_turn()
@@ -441,6 +461,9 @@ func damage_object_at(tile: Vector2i, amount: int) -> void:
 
 
 func _process(_delta: float) -> void:
+	if enemy_turn_in_progress or player_move_in_progress:
+		return
+
 	var move_dir := _read_move_input()
 	if move_dir == Vector2i.ZERO:
 		return
@@ -503,10 +526,9 @@ func _read_move_input() -> Vector2i:
 
 func _try_exploration_move(direction: Vector2i) -> void:
 	var target: Vector2i = player.grid_position + direction
-	if not _move_entity_to_tile(player, target):
+	if not await _move_player_one_tile(target):
 		return
 
-	_resolve_entity_tile_entry(player)
 	if player.hp <= 0:
 		_finish_environment_message("You were overwhelmed.")
 		mode = GameMode.DEFEAT
@@ -539,7 +561,12 @@ func _is_entity_occupied(tile: Vector2i, ignore_entity = null) -> bool:
 	return false
 
 
-func _can_move_to_tile(tile: Vector2i, moving_entity = null) -> bool:
+func _is_tile_walkable(
+	tile: Vector2i,
+	moving_entity = null,
+	treat_player_as_blocked: bool = true,
+	treat_other_enemies_as_blocked: bool = true
+) -> bool:
 	if not _is_in_bounds(tile):
 		return false
 	if terrain_blocks_movement(tile):
@@ -549,13 +576,233 @@ func _can_move_to_tile(tile: Vector2i, moving_entity = null) -> bool:
 	if obj != null and bool(obj.blocks_movement):
 		return false
 
-	return not _is_entity_occupied(tile, moving_entity)
+	if treat_player_as_blocked and player != moving_entity and player.grid_position == tile:
+		return false
+
+	if treat_other_enemies_as_blocked:
+		for e in enemies:
+			if e == null or not is_instance_valid(e) or e == moving_entity:
+				continue
+			if e.grid_position == tile:
+				return false
+
+	return true
+
+
+func _can_move_to_tile(tile: Vector2i, moving_entity = null) -> bool:
+	return _is_tile_walkable(tile, moving_entity, true, true)
+
+
+func _get_attack_goal_tiles(target_tile: Vector2i, attack_offsets: Array[Vector2i]) -> Array[Vector2i]:
+	var goal_tiles: Array[Vector2i] = []
+
+	for offset in attack_offsets:
+		var goal_tile := target_tile - offset
+		if not _is_in_bounds(goal_tile):
+			continue
+		goal_tiles.append(goal_tile)
+
+	return goal_tiles
+
+
+func _find_bfs_path(
+	start_tile: Vector2i,
+	goal_tile: Vector2i,
+	moving_entity = null,
+	treat_player_as_blocked: bool = true,
+	treat_other_enemies_as_blocked: bool = true
+) -> Array[Vector2i]:
+	var path: Array[Vector2i] = []
+	if start_tile == goal_tile:
+		return path
+	if not _is_tile_walkable(goal_tile, moving_entity, treat_player_as_blocked, treat_other_enemies_as_blocked):
+		return path
+
+	var came_from: Dictionary = {start_tile: start_tile}
+	var frontier: Array[Vector2i] = [start_tile]
+	var frontier_index := 0
+
+	while frontier_index < frontier.size():
+		var current := frontier[frontier_index]
+		frontier_index += 1
+
+		if current == goal_tile:
+			break
+
+		for direction in CARDINAL_DIRECTIONS:
+			var next_tile := current + direction
+			if came_from.has(next_tile):
+				continue
+			if not _is_tile_walkable(next_tile, moving_entity, treat_player_as_blocked, treat_other_enemies_as_blocked):
+				continue
+
+			came_from[next_tile] = current
+			frontier.append(next_tile)
+
+	if not came_from.has(goal_tile):
+		return path
+
+	var step := goal_tile
+	while step != start_tile:
+		path.push_front(step)
+		step = came_from[step]
+
+	return path
+
+
+func _find_path_to_nearest_goal(
+	start_tile: Vector2i,
+	goal_tiles: Array[Vector2i],
+	moving_entity = null,
+	treat_player_as_blocked: bool = true,
+	treat_other_enemies_as_blocked: bool = true
+) -> Array[Vector2i]:
+	var best_path: Array[Vector2i] = []
+	var found_path := false
+
+	for goal_tile in goal_tiles:
+		var path := _find_bfs_path(
+			start_tile,
+			goal_tile,
+			moving_entity,
+			treat_player_as_blocked,
+			treat_other_enemies_as_blocked
+		)
+		if path.is_empty():
+			continue
+		if not found_path or path.size() < best_path.size():
+			best_path = path
+			found_path = true
+
+	return best_path
+
+
+func _find_enemy_path_to_target(
+	enemy: Enemy,
+	target_tile: Vector2i,
+	treat_other_enemies_as_blocked: bool = true,
+	log_debug: bool = false
+) -> Array[Vector2i]:
+	var path: Array[Vector2i] = []
+	if enemy == null or not is_instance_valid(enemy):
+		return path
+
+	var goal_tiles := _get_attack_goal_tiles(target_tile, enemy.get_attack_offsets())
+	path = _find_path_to_nearest_goal(
+		enemy.grid_position,
+		goal_tiles,
+		enemy,
+		true,
+		treat_other_enemies_as_blocked
+	)
+
+	var found_goal := not path.is_empty()
+	var best_goal_tile := path[path.size() - 1] if found_goal else Vector2i.ZERO
+	if log_debug:
+		_debug_log_enemy_path(enemy, best_goal_tile, path, found_goal)
+	return path
+
+
+func _grid_to_world_center(tile: Vector2i) -> Vector2:
+	@warning_ignore("integer_division")
+	return Vector2(tile * TILE_SIZE) + Vector2(TILE_SIZE / 2, TILE_SIZE / 2)
+
+
+func _move_enemy_one_tile(enemy: Enemy, next_tile: Vector2i) -> bool:
+	if enemy == null or not is_instance_valid(enemy):
+		return false
+	if not _can_move_to_tile(next_tile, enemy):
+		return false
+
+	if debug_enemy_step_logging:
+		var step_hazard := String(get_hazard_at(next_tile).get("type", ""))
+		if step_hazard.is_empty():
+			print("Enemy step ", enemy.name, ": ", enemy.grid_position, " -> ", next_tile)
+		else:
+			print("Enemy step ", enemy.name, ": ", enemy.grid_position, " -> ", next_tile, " through ", step_hazard)
+
+	var target_position := _grid_to_world_center(next_tile)
+	if enemy_step_duration > 0.0:
+		var tween := create_tween()
+		tween.tween_property(enemy, "position", target_position, enemy_step_duration)
+		await tween.finished
+		if enemy == null or not is_instance_valid(enemy):
+			return false
+
+	enemy.set_grid_position(next_tile)
+	_resolve_entity_tile_entry(enemy)
+	if enemy == null or not is_instance_valid(enemy):
+		return false
+
+	return true
+
+
+func _move_enemy_along_path(enemy: Enemy, path: Array[Vector2i], movement_allowance: int) -> int:
+	if enemy == null or not is_instance_valid(enemy):
+		return 0
+	if movement_allowance <= 0 or path.is_empty():
+		return 0
+
+	var steps_taken := 0
+	for next_tile in path:
+		if steps_taken >= movement_allowance:
+			break
+		if not await _move_enemy_one_tile(enemy, next_tile):
+			break
+
+		steps_taken += 1
+		if enemy == null or not is_instance_valid(enemy):
+			break
+		if enemy.state == Enemy.State.DEFEATED:
+			break
+
+	return steps_taken
+
+
+func _debug_log_enemy_path(enemy: Enemy, goal_tile: Vector2i, path: Array[Vector2i], found_goal: bool) -> void:
+	if not debug_enemy_pathfinding or enemy == null or not is_instance_valid(enemy):
+		return
+
+	if not found_goal:
+		print("Enemy path ", enemy.name, ": no route")
+		return
+
+	var step_text: Array[String] = []
+	for tile in path:
+		step_text.append(str(tile))
+	print("Enemy path ", enemy.name, " -> ", goal_tile, ": ", " -> ".join(step_text))
 
 
 func _move_entity_to_tile(entity, target: Vector2i) -> bool:
 	if not _can_move_to_tile(target, entity):
 		return false
 	entity.set_grid_position(target)
+	return true
+
+
+func _move_player_one_tile(target: Vector2i) -> bool:
+	if player_move_in_progress:
+		return false
+	if not _can_move_to_tile(target, player):
+		return false
+
+	player_move_in_progress = true
+	if debug_player_step_logging:
+		var step_hazard := String(get_hazard_at(target).get("type", ""))
+		if step_hazard.is_empty():
+			print("Player step: ", player.grid_position, " -> ", target)
+		else:
+			print("Player step: ", player.grid_position, " -> ", target, " through ", step_hazard)
+
+	var target_position := _grid_to_world_center(target)
+	if player_step_duration > 0.0:
+		var tween := create_tween()
+		tween.tween_property(player, "position", target_position, player_step_duration)
+		await tween.finished
+
+	player.set_grid_position(target)
+	_resolve_entity_tile_entry(player)
+	player_move_in_progress = false
 	return true
 
 
@@ -566,12 +813,11 @@ func _try_combat_move(direction: Vector2i) -> void:
 		return
 
 	var target: Vector2i = player.grid_position + direction
-	if not _move_entity_to_tile(player, target):
+	if not await _move_player_one_tile(target):
 		return
 
 	current_energy -= 1
 	movement_left -= 1
-	_resolve_entity_tile_entry(player)
 	message = _consume_environment_messages("Moved to %s." % [str(player.grid_position)])
 	_update_all_enemy_intent()
 	_refresh_ui()
@@ -586,10 +832,12 @@ func _start_combat() -> void:
 
 
 func _begin_player_turn(draw_card: bool = true) -> void:
+	enemy_turn_in_progress = false
+	player_move_in_progress = false
 	player.reset_turn_state()
 	current_energy = max_energy
 	movement_left = PLAYER_SPEED
-	_set_current_target(_get_nearest_enemy())
+	
 	if draw_card:
 		_draw_cards_with_shared_rules(1)
 	if must_resolve_overflow:
@@ -610,7 +858,11 @@ func _end_player_turn() -> void:
 		return
 
 	message = _consume_environment_messages("Enemy turn.")
-	_enemy_take_turn()
+	enemy_turn_in_progress = true
+	_refresh_ui()
+	queue_redraw()
+	await _enemy_take_turn()
+	enemy_turn_in_progress = false
 	if mode != GameMode.COMBAT:
 		_refresh_ui()
 		queue_redraw()
@@ -634,11 +886,15 @@ func _enemy_take_turn() -> void:
 				player.become_hidden_or_revealed()
 			message = "Enemy attacks for %d." % e.damage
 		else:
-			var direction := _step_toward(e.grid_position, player.grid_position)
-			if direction != Vector2i.ZERO and _move_entity_to_tile(e, e.grid_position + direction):
+			var path := _find_enemy_path_to_target(e, player.grid_position, true, true)
+			if not path.is_empty():
 				message = "Enemy advances."
-				_resolve_entity_tile_entry(e)
+				_update_message()
+			var moved_steps := await _move_enemy_along_path(e, path, e.get_movement_allowance())
+			if moved_steps > 0:
 				message = _consume_environment_messages(message)
+			elif path.is_empty():
+				message = _consume_environment_messages("Enemy holds position.")
 			if e != null and is_instance_valid(e) and player.grid_position in e.get_threatened_tiles():
 				player.take_damage(e.damage)
 				message += " Then hits for %d." % e.damage
@@ -666,6 +922,8 @@ func _enemy_take_turn() -> void:
 
 
 func _handle_card_shortcut(index: int) -> void:
+	if enemy_turn_in_progress or player_move_in_progress:
+		return
 	if index >= deck_manager.hand.size():
 		return
 	if must_resolve_overflow:
@@ -690,14 +948,14 @@ func _play_card(index: int) -> void:
 		message = "Not enough energy for %s." % card["name"]
 		_update_message()
 		return
-
+		
 	var result := _resolve_card(card)
 	if not result["success"]:
 		message = result["message"]
 		_update_message()
 		return
-
 	current_energy -= int(card["cost"])
+	
 	var played := deck_manager.play_from_hand(index)
 	message = "Played %s. %s" % [played["name"], result["message"]]
 
@@ -752,6 +1010,8 @@ func _play_lunge() -> Dictionary:
 	if _is_adjacent(player.grid_position, current_target.grid_position):
 		var lunge_damage := _modify_attack_damage(6)
 		current_target.take_damage(lunge_damage)
+		if player.grid_position in threatened_tiles:
+			_start_combat()
 		return {"success": true, "message": _consume_environment_messages("Closed in and dealt %d damage." % lunge_damage)}
 	return {"success": true, "message": _consume_environment_messages("Moved closer, but no hit.")}
 
@@ -810,6 +1070,8 @@ func _update_enemy_intent(e: Enemy) -> void:
 	if mode == GameMode.COMBAT:
 		if _is_adjacent(player.grid_position, e.grid_position):
 			e.set_intent_text("Attack %d" % e.damage)
+		elif _find_enemy_path_to_target(e, player.grid_position, true).is_empty():
+			e.set_intent_text("Hold")
 		else:
 			e.set_intent_text("Advance")
 	else:
@@ -847,7 +1109,7 @@ func _rebuild_hand() -> void:
 		button.custom_minimum_size = Vector2(150, 96)
 		button.text = "%d. %s\nCost %d\n%s" % [i + 1, card["name"], card["cost"], card["text"]]
 		button.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		button.disabled = mode == GameMode.DEFEAT or mode == GameMode.VICTORY
+		button.disabled = mode == GameMode.DEFEAT or mode == GameMode.VICTORY or enemy_turn_in_progress or player_move_in_progress
 		button.pressed.connect(func() -> void: _handle_card_shortcut(card_index))
 		hand_box.add_child(button)
 
@@ -861,6 +1123,10 @@ func _controls_text() -> String:
 		GameMode.EXPLORATION:
 			return "Explore with arrow keys/WASD. Walk into the enemy to trigger combat. Number keys can play any usable card."
 		GameMode.COMBAT:
+			if enemy_turn_in_progress:
+				return "Enemy turn: movement resolves one tile at a time."
+			if player_move_in_progress:
+				return "Movement in progress."
 			if must_resolve_overflow:
 				return "Hand overflow: press 1-5 or click a card to discard it. Space is locked."
 			return "Combat: arrow keys/WASD move for 1 energy, 1-5 play cards, Space ends turn."

@@ -7,6 +7,7 @@ const TILE_SIZE := 48
 @onready var _intent_label: Label = $IntentLabel
 
 var grid_position := Vector2i.ZERO
+var movement_per_turn := 3
 var hp := 20
 var max_hp := 20
 var damage := 5
@@ -37,6 +38,14 @@ func get_threatened_tiles() -> Array[Vector2i]:
 	for offset in threat_offsets:
 		tiles.append(grid_position + offset)
 	return tiles
+
+
+func get_attack_offsets() -> Array[Vector2i]:
+	return threat_offsets.duplicate()
+
+
+func get_movement_allowance() -> int:
+	return movement_per_turn
 
 func set_intent_text(value: String) -> void:
 	if _intent_label.text == value:
