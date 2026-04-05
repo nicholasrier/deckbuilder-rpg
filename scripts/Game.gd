@@ -94,8 +94,7 @@ func _get_nearest_enemy() -> Enemy:
 
 
 func _on_enemy_died(the_enemy: Enemy) -> void:
-	if current_target == the_enemy and mode == GameMode.COMBAT:
-		current_target = _get_nearest_enemy()
+	_handle_destroyed_target(the_enemy)
 
 	enemies.erase(the_enemy)
 	the_enemy.hide()
@@ -116,6 +115,8 @@ func _on_enemy_intent_changed(_enemy: Enemy, _new_intent: String) -> void:
 func _on_environment_object_destroyed(obj) -> void:
 	if obj == null:
 		return
+
+	_handle_destroyed_target(obj)
 
 	var object_tile: Vector2i = obj.grid_position
 	if object_layer.get(object_tile) == obj:
@@ -181,9 +182,6 @@ func _draw() -> void:
 			_draw_tile_overlay(tile, tile_pos)
 
 	for t in targets:
-		if current_target != null and not is_instance_valid(current_target):
-			current_target = null
-		
 		if t == null or not is_instance_valid(t):
 			continue
 
@@ -227,17 +225,31 @@ func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> void:
 	targets.append(e)
 
 func _input(event: InputEvent) -> void:
-	#if mode != GameMode.COMBAT:
-		#return
-
 	if event is InputEventMouseButton \
 	and event.button_index == MOUSE_BUTTON_LEFT \
 	and event.pressed:
+		if _is_pointer_over_card_ui():
+			return
+
 		var world_pos := get_global_mouse_position()
+		var clicked_tile := _world_to_grid(world_pos)
+		if not _is_in_bounds(clicked_tile):
+			return
+
 		var clicked_targetable: Node2D = _get_targetable_at_world_pos(world_pos)
-		if clicked_targetable != null:
-			current_target = clicked_targetable
-			queue_redraw()
+		_set_current_target(clicked_targetable)
+
+
+func _is_pointer_over_card_ui() -> bool:
+	var mouse_pos := get_viewport().get_mouse_position()
+	if hand_box.get_global_rect().has_point(mouse_pos):
+		return true
+
+	for child in hand_box.get_children():
+		if child is Control and child.get_global_rect().has_point(mouse_pos):
+			return true
+
+	return false
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -349,14 +361,49 @@ func add_object(obj, tile: Vector2i) -> void:
 		targets.append(obj)
 	queue_redraw()
 
-func _resolve_targeting(destroyed_target: Node2D) -> void:
-	if destroyed_target == current_target:
-		current_target == null
+func _set_current_target(target: Node2D) -> void:
+	current_target = target if target != null and is_instance_valid(target) else null
 	queue_redraw()
+
+
+func _remove_target_reference(target: Node2D) -> void:
+	targets.erase(target)
+
+
+func _get_fallback_target_after_destroy(destroyed_target: Node2D) -> Node2D:
+	if mode == GameMode.COMBAT:
+		if destroyed_target is Enemy:
+			return _get_nearest_enemy_excluding(destroyed_target)
+		return _get_nearest_enemy()
+	return null
+
+
+func _handle_destroyed_target(destroyed_target: Node2D) -> void:
+	if destroyed_target == null:
+		return
+
+	_remove_target_reference(destroyed_target)
+	_set_current_target(_get_fallback_target_after_destroy(destroyed_target))
+
+
+func _get_nearest_enemy_excluding(excluded_enemy: Enemy) -> Enemy:
+	var nearest: Enemy = null
+	var best_distance := INF
+
+	for e in enemies:
+		if e == null or not is_instance_valid(e) or e == excluded_enemy:
+			continue
+
+		var dist: float = abs(e.grid_position.x - player.grid_position.x) + abs(e.grid_position.y - player.grid_position.y)
+		if dist < best_distance:
+			best_distance = dist
+			nearest = e
+
+	return nearest
 
 func remove_object_at(tile: Vector2i) -> void:
 	var obj = get_object_at(tile)
-	_resolve_targeting(obj)
+	_handle_destroyed_target(obj)
 	if obj == null:
 		object_layer.erase(tile)
 		return
@@ -522,7 +569,7 @@ func _begin_player_turn(draw_card: bool = true) -> void:
 	player.reset_turn_state()
 	current_energy = max_energy
 	movement_left = PLAYER_SPEED
-	current_target = _get_nearest_enemy()
+	_set_current_target(_get_nearest_enemy())
 	if draw_card:
 		deck_manager.draw_cards(1)
 	must_resolve_overflow = deck_manager.hand.size() > 5
@@ -735,6 +782,7 @@ func _check_end_of_combat() -> void:
 	if not enemies.is_empty():
 		return
 	mode = GameMode.EXPLORATION
+	_set_current_target(null)
 	message = _consume_environment_messages("")
 	_update_message()
 
