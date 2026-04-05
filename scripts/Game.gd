@@ -25,6 +25,7 @@ const HAZARD_DEFS := {
 const DeckManagerScript := preload("res://scripts/DeckManager.gd")
 const CardDatabaseScript := preload("res://scripts/CardDatabase.gd")
 const CrateObjectScene := preload("res://scenes/CrateObject.tscn")
+const DrawPickupScene := preload("res://scenes/DrawPickup.tscn")
 
 enum GameMode {
 	EXPLORATION,
@@ -137,7 +138,7 @@ func _ready() -> void:
 	_build_threat_map(enemies)
 	_update_all_enemy_intent()
 	deck_manager.setup(CardDatabaseScript.make_starter_deck())
-	deck_manager.draw_cards(5)
+	_draw_cards_with_shared_rules(5)
 	current_energy = max_energy
 	
 	
@@ -163,6 +164,9 @@ func _setup_environment_layers() -> void:
 
 	var crate := CrateObjectScene.instantiate()
 	add_object(crate, Vector2i(3, 5))
+
+	var draw_pickup := DrawPickupScene.instantiate()
+	add_object(draw_pickup, Vector2i(2, 3))
 
 
 func _draw() -> void:
@@ -361,6 +365,20 @@ func add_object(obj, tile: Vector2i) -> void:
 		targets.append(obj)
 	queue_redraw()
 
+
+func consume_map_pickup(pickup) -> void:
+	if pickup == null:
+		return
+
+	var pickup_tile: Vector2i = pickup.grid_position
+	if object_layer.get(pickup_tile) == pickup:
+		object_layer.erase(pickup_tile)
+
+	_remove_target_reference(pickup)
+	pickup.hide()
+	pickup.queue_free()
+	queue_redraw()
+
 func _set_current_target(target: Node2D) -> void:
 	current_target = target if target != null and is_instance_valid(target) else null
 	queue_redraw()
@@ -426,7 +444,12 @@ func _process(_delta: float) -> void:
 	var move_dir := _read_move_input()
 	if move_dir == Vector2i.ZERO:
 		return
-
+	
+	if must_resolve_overflow:
+		message = "Hand overflow: play or discard a card first."
+		_update_message()
+		return
+	
 	if mode == GameMode.EXPLORATION:
 		_try_exploration_move(move_dir)
 	elif mode == GameMode.COMBAT:
@@ -483,7 +506,7 @@ func _try_exploration_move(direction: Vector2i) -> void:
 	if not _move_entity_to_tile(player, target):
 		return
 
-	_apply_on_enter_tile_effects(player, target)
+	_resolve_entity_tile_entry(player)
 	if player.hp <= 0:
 		_finish_environment_message("You were overwhelmed.")
 		mode = GameMode.DEFEAT
@@ -493,12 +516,13 @@ func _try_exploration_move(direction: Vector2i) -> void:
 
 	if not enemies.is_empty():
 		if is_player_in_threat():
-			_finish_environment_message("")
 			_start_combat()
 			return
 		message = _consume_environment_messages("Exploration: close the gap to trigger combat.")
+	else:
+		message = _consume_environment_messages("Moved to %s." % [str(player.grid_position)])
 
-	_update_message()
+	_refresh_ui()
 	queue_redraw()
 
 
@@ -536,10 +560,6 @@ func _move_entity_to_tile(entity, target: Vector2i) -> bool:
 
 
 func _try_combat_move(direction: Vector2i) -> void:
-	if must_resolve_overflow:
-		message = "Hand overflow: play or discard a card first."
-		_update_message()
-		return
 	if current_energy <= 0 or movement_left <= 0:
 		message = "No movement left this turn."
 		_update_message()
@@ -551,7 +571,7 @@ func _try_combat_move(direction: Vector2i) -> void:
 
 	current_energy -= 1
 	movement_left -= 1
-	_apply_on_enter_tile_effects(player, target)
+	_resolve_entity_tile_entry(player)
 	message = _consume_environment_messages("Moved to %s." % [str(player.grid_position)])
 	_update_all_enemy_intent()
 	_refresh_ui()
@@ -561,7 +581,7 @@ func _try_combat_move(direction: Vector2i) -> void:
 func _start_combat() -> void:
 	mode = GameMode.COMBAT
 	combat_turn = 1
-	message = "Combat started. Draw 1 each turn, but your hand persists."
+	message = _consume_environment_messages("Combat started. Draw 1 each turn, but your hand persists.")
 	_begin_player_turn(false)
 
 
@@ -571,8 +591,7 @@ func _begin_player_turn(draw_card: bool = true) -> void:
 	movement_left = PLAYER_SPEED
 	_set_current_target(_get_nearest_enemy())
 	if draw_card:
-		deck_manager.draw_cards(1)
-	must_resolve_overflow = deck_manager.hand.size() > 5
+		_draw_cards_with_shared_rules(1)
 	if must_resolve_overflow:
 		message = "Hand overflow. Play or discard one card."
 
@@ -618,7 +637,7 @@ func _enemy_take_turn() -> void:
 			var direction := _step_toward(e.grid_position, player.grid_position)
 			if direction != Vector2i.ZERO and _move_entity_to_tile(e, e.grid_position + direction):
 				message = "Enemy advances."
-				_apply_on_enter_tile_effects(e, e.grid_position)
+				_resolve_entity_tile_entry(e)
 				message = _consume_environment_messages(message)
 			if e != null and is_instance_valid(e) and player.grid_position in e.get_threatened_tiles():
 				player.take_damage(e.damage)
@@ -729,7 +748,7 @@ func _play_lunge() -> Dictionary:
 	if direction != Vector2i.ZERO:
 		var lunge_tile: Vector2i = player.grid_position + direction
 		if lunge_tile != current_target.grid_position and _move_entity_to_tile(player, lunge_tile):
-			_apply_on_enter_tile_effects(player, lunge_tile)
+			_resolve_entity_tile_entry(player)
 	if _is_adjacent(player.grid_position, current_target.grid_position):
 		var lunge_damage := _modify_attack_damage(6)
 		current_target.take_damage(lunge_damage)
@@ -757,8 +776,8 @@ func _play_slip_past() -> Dictionary:
 	var old_player_pos: Vector2i = player.grid_position
 	player.set_grid_position(current_target.grid_position)
 	current_target.set_grid_position(old_player_pos)
-	_apply_on_enter_tile_effects(player, player.grid_position)
-	_apply_on_enter_tile_effects(current_target, current_target.grid_position)
+	_resolve_entity_tile_entry(player)
+	_resolve_entity_tile_entry(current_target)
 	return {"success": true, "message": _consume_environment_messages("Swapped positions.")}
 
 
@@ -901,6 +920,55 @@ func get_tile_tint(tile: Vector2i) -> Color:
 			return Color(0.239216, 0.133333, 0.14902, 1)
 
 	return tint
+
+
+func _draw_cards_with_shared_rules(count: int) -> Array[Dictionary]:
+	var drawn := deck_manager.draw_cards(count)
+	must_resolve_overflow = deck_manager.hand.size() > 5
+	return drawn
+
+
+func resolve_draw_pickup(draw_count: int) -> void:
+	var drawn := _draw_cards_with_shared_rules(draw_count)
+	if drawn.is_empty():
+		pending_environment_messages.append("Draw %d pickup triggered, but there were no cards to draw." % draw_count)
+	elif drawn.size() < draw_count:
+		pending_environment_messages.append("Draw %d pickup triggered and drew %d card(s)." % [draw_count, drawn.size()])
+	else:
+		pending_environment_messages.append("Draw %d pickup triggered." % draw_count)
+
+	if must_resolve_overflow:
+		pending_environment_messages.append("Hand overflow: play or discard a card.")
+
+
+func _resolve_entity_tile_entry(entity) -> void:
+	if entity == null or not is_instance_valid(entity):
+		return
+
+	_apply_on_enter_tile_effects(entity, entity.grid_position)
+	if entity == player:
+		_resolve_tile_triggers(player)
+
+
+func _resolve_tile_triggers(entered_player) -> void:
+	if entered_player == null or not is_instance_valid(entered_player):
+		return
+
+	var tile_triggers := _get_tile_triggers(entered_player.grid_position)
+	for trigger in tile_triggers:
+		if trigger == null or not is_instance_valid(trigger):
+			continue
+		trigger.on_player_enter(entered_player, self)
+
+
+func _get_tile_triggers(tile: Vector2i) -> Array:
+	var triggers: Array = []
+	var obj = get_object_at(tile)
+	if obj == null or not is_instance_valid(obj):
+		return triggers
+	if obj.triggers_on_player_enter():
+		triggers.append(obj)
+	return triggers
 
 
 func _apply_on_enter_tile_effects(entity, tile: Vector2i) -> void:

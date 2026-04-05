@@ -19,6 +19,15 @@ func set_grid_position(value: Vector2i) -> void:
 	@warning_ignore("integer_division")
 	position = Vector2(grid_position * TILE_SIZE) + Vector2(TILE_SIZE / 2, TILE_SIZE / 2)
 
+
+func triggers_on_player_enter() -> bool:
+	return false
+
+
+func on_player_enter(_player, _game) -> void:
+	pass
+
+
 func take_damage(amount: int) -> void:
 	if hp <= 0:
 		return
