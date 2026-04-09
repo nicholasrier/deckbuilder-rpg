@@ -22,7 +22,7 @@ const CARDS := {
 		"name": "Block",
 		"cost": 1,
 		"text": "Gain 5 block.",
-		"combat_only": true
+		"combat_only": false
 	},
 	"lunge": {
 		"id": "lunge",
@@ -36,20 +36,27 @@ const CARDS := {
 		"name": "Backstab",
 		"cost": 1,
 		"text": "Deal 5 damage, or 9 from behind.",
-		"combat_only": true
+		"combat_only": false
 	},
 	"slip_past": {
 		"id": "slip_past",
 		"name": "Slip Past",
 		"cost": 1,
-		"text": "Swap places with an adjacent enemy.",
-		"combat_only": true
+		"text": "Swap places with an adjacent movable target.",
+		"combat_only": false
 	},
 	"unseen": {
 		"id": "unseen",
 		"name": "Unseen",
 		"cost": 1,
 		"text": "Become hidden. Your next attack deals 50% more damage.",
+		"combat_only": false
+	},
+	"dash": {
+		"id": "dash",
+		"name": "dash",
+		"cost": 0,
+		"text": "Move quickly, unscathed. Add one tile to your next movement.",
 		"combat_only": false
 	}
 }

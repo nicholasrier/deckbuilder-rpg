@@ -44,6 +44,13 @@ text = "Mode: Exploration"
 layout_mode = 2
 size_flags_vertical = 3
 
+[node name="CombatBanner" type="Label" parent="CanvasLayer/HUD/Root"]
+visible = false
+layout_mode = 2
+theme_override_font_sizes/font_size = 36
+text = "COMBAT"
+horizontal_alignment = 1
+
 [node name="CenterMessage" type="Label" parent="CanvasLayer/HUD/Root"]
 layout_mode = 2
 text = "Move with arrow keys or WASD."

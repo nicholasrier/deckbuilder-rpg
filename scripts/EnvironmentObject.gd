@@ -9,9 +9,10 @@ var grid_position := Vector2i.ZERO
 var blocks_movement := true
 var hp := 1
 var max_hp := 1
-var object_type := "object"
-var is_destructible := false
-var is_targetable := false
+var object_type: String = "object"
+var is_destructible: bool = false
+var is_targetable: bool = false
+var is_movable: bool = false
 
 
 func set_grid_position(value: Vector2i) -> void:

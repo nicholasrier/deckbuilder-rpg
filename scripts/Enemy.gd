@@ -3,18 +3,28 @@ extends CharacterBody2D
 class_name Enemy
 
 const TILE_SIZE := 48
+const HEALTH_BAR_SIZE: Vector2 = Vector2(28.0, 4.0)
+const HEALTH_BAR_OFFSET: Vector2 = Vector2(-14.0, -28.0)
+const HEALTH_BAR_BORDER_COLOR: Color = Color(0.05, 0.05, 0.08, 0.95)
+const HEALTH_BAR_EMPTY_COLOR: Color = Color(0.22, 0.10, 0.12, 0.92)
+const HEALTH_BAR_FILL_COLOR: Color = Color(0.36, 0.84, 0.42, 1.0)
 
 @onready var _intent_label: Label = $IntentLabel
 
 @export_range(0.1, 5.0, 0.05) var exploration_cadence := 0.85
 @export_range(1, 6, 1) var exploration_detection_range := 3
 @export_range(0, 2, 1) var exploration_side_vision := 1
+@export_range(1, 10, 1) var max_energy := 3
+@export_range(1, 10, 1) var movement_energy_cost := 1
+@export_range(1, 10, 1) var attack_energy_cost := 1
+@export_range(1, 10, 1) var special_action_energy_cost := 2
 
 var grid_position := Vector2i.ZERO
 var movement_per_turn := 3
 var hp := 20
 var max_hp := 20
 var damage := 5
+var current_energy := 0
 var facing_dir := Vector2i.LEFT
 var patrol_points: Array[Vector2i] = []
 var look_directions: Array[Vector2i] = []
@@ -44,6 +54,7 @@ var patrol_forward := true
 var look_direction_index := 0
 var awareness_state := AwarenessState.IDLE
 var exploration_action_in_progress := false
+var show_health_bar: bool = false
 
 func _ready() -> void:
 	threat_offsets = [
@@ -54,6 +65,25 @@ func _ready() -> void:
 	]
 	if look_directions.is_empty():
 		look_directions = [facing_dir]
+	reset_combat_energy()
+
+
+func _draw() -> void:
+	if not show_health_bar:
+		return
+	if state != State.ALIVE or max_hp <= 0:
+		return
+
+	var clamped_hp: int = clamp(hp, 0, max_hp)
+	var hp_ratio: float = float(clamped_hp) / float(max_hp)
+	var bar_rect: Rect2 = Rect2(HEALTH_BAR_OFFSET, HEALTH_BAR_SIZE)
+	var fill_width: float = floor(bar_rect.size.x * hp_ratio)
+
+	draw_rect(bar_rect.grow(1.0), HEALTH_BAR_BORDER_COLOR, true)
+	draw_rect(bar_rect, HEALTH_BAR_EMPTY_COLOR, true)
+	if fill_width > 0.0:
+		var fill_rect: Rect2 = Rect2(bar_rect.position, Vector2(fill_width, bar_rect.size.y))
+		draw_rect(fill_rect, HEALTH_BAR_FILL_COLOR, true)
 
 func set_grid_position(value: Vector2i, sync_visual: bool = true) -> void:
 	grid_position = value
@@ -75,6 +105,42 @@ func get_attack_offsets() -> Array[Vector2i]:
 
 func get_movement_allowance() -> int:
 	return movement_per_turn
+
+
+func reset_combat_energy() -> void:
+	current_energy = max_energy
+
+
+func can_afford_action(cost: int) -> bool:
+	return cost >= 0 and current_energy >= cost
+
+
+func spend_energy(cost: int) -> bool:
+	if cost < 0:
+		return false
+	if current_energy < cost:
+		return false
+	current_energy -= cost
+	return true
+
+
+func get_movement_energy_cost(tiles: int = 1) -> int:
+	return max(tiles, 0) * movement_energy_cost
+
+
+func get_attack_energy_cost() -> int:
+	return attack_energy_cost
+
+
+func get_special_action_energy_cost() -> int:
+	return special_action_energy_cost
+
+
+func set_health_bar_visible(value: bool) -> void:
+	if show_health_bar == value:
+		return
+	show_health_bar = value
+	queue_redraw()
 
 func clear_patrol() -> void:
 	patrol_points.clear()
@@ -155,6 +221,7 @@ func set_intent_text(value: String) -> void:
 
 func take_damage(amount: int) -> void:
 	hp = max(hp - amount, 0)
+	queue_redraw()
 	if hp <= 0: 
 		die()
 

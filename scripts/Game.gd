@@ -32,9 +32,13 @@ const DeckManagerScript := preload("res://scripts/DeckManager.gd")
 const CardDatabaseScript := preload("res://scripts/CardDatabase.gd")
 const CrateObjectScene := preload("res://scenes/CrateObject.tscn")
 const DrawPickupScene := preload("res://scenes/DrawPickup.tscn")
+const ENEMY_COMBAT_PLAN_HOLD: StringName = &"hold"
+const ENEMY_COMBAT_PLAN_PLAYER: StringName = &"player"
+const ENEMY_COMBAT_PLAN_DESTRUCTIBLE_OBJECT: StringName = &"destructible_object"
 
 enum GameMode {
 	EXPLORATION,
+	COMBAT_TRANSITION,
 	COMBAT,
 	VICTORY,
 	DEFEAT
@@ -54,40 +58,45 @@ enum ExplorationState {
 @export_range(0.0, 0.5, 0.01) var player_step_duration := 0.12
 @export var debug_player_step_logging := false
 @export_range(0.0, 0.5, 0.01) var enemy_rotation_duration := 0.08
+@export_range(0.0, 1.0, 0.01) var combat_transition_prompt_delay: float = 0.7
 
 @onready var player = $Player
 
 @onready var mode_label: Label = $CanvasLayer/HUD/Root/TopBar/ModeLabel
 @onready var stats_label: Label = $CanvasLayer/HUD/Root/TopBar/StatsLabel
+@onready var combat_banner: Label = $CanvasLayer/HUD/Root/CombatBanner
 @onready var center_message: Label = $CanvasLayer/HUD/Root/CenterMessage
 @onready var hand_box: HBoxContainer = $CanvasLayer/HUD/Root/HandPanel/HandMargin/HandBox
 @onready var controls_label: Label = $CanvasLayer/HUD/Root/ControlsLabel
 
 var deck_manager = DeckManagerScript.new()
-var mode := GameMode.EXPLORATION
-var combat_turn := 0
-var current_energy := 0
-var max_energy := 3
-var movement_left := PLAYER_SPEED
-var must_resolve_overflow := false
-var message := "Move with arrow keys or WASD."
+var mode: int = GameMode.EXPLORATION
+var combat_turn: int = 0
+var current_energy: int = 0
+var max_energy: int = 3
+var movement_left: int = PLAYER_SPEED
+var must_resolve_overflow: bool = false
+var message: String = "Move with arrow keys or WASD."
 var enemies: Array[Enemy] = []
 @export var targets: Array[Node2D] = []
-var threatened_tiles := {}
+var threatened_tiles: Dictionary = {}
 @export var current_target: Node2D = null
 var terrain_layer: Dictionary = {}
 var hazard_layer: Dictionary = {}
 var object_layer: Dictionary = {}
 var pending_environment_messages: Array[String] = []
-var enemy_turn_in_progress := false
-var player_move_in_progress := false
-var exploration_state := ExplorationState.WAITING_FOR_PLAYER_INPUT
+var enemy_turn_in_progress: bool = false
+var player_move_in_progress: bool = false
+var exploration_state: int = ExplorationState.WAITING_FOR_PLAYER_INPUT
 var exploration_reserved_tiles: Dictionary = {}
 var exploration_enemy_timers: Dictionary = {}
-var exploration_active_presentations := 0
-var exploration_pending_combat := false
+var exploration_active_presentations: int = 0
+var exploration_pending_combat: bool = false
 var exploration_combat_trigger_enemy: Enemy = null
-var exploration_combat_trigger_reason := ""
+var exploration_combat_trigger_reason: String = ""
+var combat_transition_running: bool = false
+var combat_transition_can_start: bool = false
+var suppress_next_move_input: bool = false
 
 
 func mark_threat_tile(tile: Vector2i) -> void:
@@ -228,13 +237,21 @@ func _setup_environment_layers() -> void:
 	_set_terrain(Vector2i(4, 2), "wall")
 	_set_terrain(Vector2i(4, 3), "wall")
 	_set_terrain(Vector2i(4, 4), "wall")
+	_set_terrain(Vector2i(7, 1), "wall")
+	_set_terrain(Vector2i(5, 1), "wall")
+	_set_terrain(Vector2i(6, 2), "wall")
+	_set_terrain(Vector2i(7, 0), "wall")
+	_set_terrain(Vector2i(5, 0), "wall")
 
 	_set_hazard(Vector2i(2, 1), "fire")
 	_set_hazard(Vector2i(7, 5), "fire")
 
 	var crate := CrateObjectScene.instantiate()
-	add_object(crate, Vector2i(3, 5))
-
+	crate = CrateObjectScene.instantiate()
+	add_object(crate, Vector2i(6, 0))
+	#crate = CrateObjectScene.instantiate()
+	#add_object(crate, Vector2i(5, 0))
+	
 	var draw_pickup := DrawPickupScene.instantiate()
 	add_object(draw_pickup, Vector2i(2, 3))
 
@@ -301,6 +318,8 @@ func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> Enemy:
 
 
 func _is_input_locked() -> bool:
+	if mode == GameMode.COMBAT_TRANSITION:
+		return true
 	if mode == GameMode.EXPLORATION:
 		return exploration_pending_combat or player_move_in_progress
 	return enemy_turn_in_progress or player_move_in_progress
@@ -311,6 +330,9 @@ func _is_movement_locked() -> bool:
 
 
 func _input(event: InputEvent) -> void:
+	if mode == GameMode.COMBAT_TRANSITION:
+		_handle_combat_transition_input(event)
+		return
 	if _is_input_locked():
 		return
 
@@ -342,6 +364,9 @@ func _is_pointer_over_card_ui() -> bool:
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	if mode == GameMode.COMBAT_TRANSITION:
+		_handle_combat_transition_input(event)
+		return
 	if _is_input_locked():
 		return
 
@@ -363,6 +388,26 @@ func _unhandled_input(event: InputEvent) -> void:
 		_handle_card_shortcut(3)
 	elif event.is_action_pressed("card_5"):
 		_handle_card_shortcut(4)
+
+
+func _handle_combat_transition_input(event: InputEvent) -> void:
+	get_viewport().set_input_as_handled()
+	if not combat_transition_can_start:
+		return
+	if not _is_combat_transition_confirm_event(event):
+		return
+
+	combat_transition_can_start = false
+	suppress_next_move_input = true
+	_start_combat(exploration_combat_trigger_enemy, exploration_combat_trigger_reason)
+
+
+func _is_combat_transition_confirm_event(event: InputEvent) -> bool:
+	if event is InputEventKey:
+		return event.pressed and not event.echo
+	if event is InputEventMouseButton:
+		return event.pressed
+	return false
 
 
 func _world_to_grid(world_pos: Vector2) -> Vector2i:
@@ -586,6 +631,9 @@ func _action_has_key(action: StringName, keycode: Key) -> bool:
 
 
 func _read_move_input() -> Vector2i:
+	if suppress_next_move_input:
+		suppress_next_move_input = false
+		return Vector2i.ZERO
 	if Input.is_action_just_pressed("move_up"):
 		return Vector2i.UP
 	if Input.is_action_just_pressed("move_down"):
@@ -646,7 +694,9 @@ func _is_tile_walkable(
 	tile: Vector2i,
 	moving_entity = null,
 	treat_player_as_blocked: bool = true,
-	treat_other_enemies_as_blocked: bool = true
+	treat_other_enemies_as_blocked: bool = true,
+	ignored_blocker: Node2D = null,
+	ignore_destructible_objects: bool = false
 ) -> bool:
 	if not _is_in_bounds(tile):
 		return false
@@ -654,18 +704,21 @@ func _is_tile_walkable(
 		return false
 
 	var obj = get_object_at(tile)
-	if obj != null and bool(obj.blocks_movement):
+	var ignore_object_blocking: bool = ignore_destructible_objects \
+		and obj is EnvironmentObject \
+		and obj.is_destructible
+	if obj != null and obj != moving_entity and obj != ignored_blocker and bool(obj.blocks_movement) and not ignore_object_blocking:
 		return false
 
 	if mode == GameMode.EXPLORATION and _is_tile_reserved_by_other(tile, moving_entity):
 		return false
 
-	if treat_player_as_blocked and player != moving_entity and player.grid_position == tile:
+	if treat_player_as_blocked and player != moving_entity and player != ignored_blocker and player.grid_position == tile:
 		return false
 
 	if treat_other_enemies_as_blocked:
 		for e in enemies:
-			if e == null or not is_instance_valid(e) or e == moving_entity:
+			if e == null or not is_instance_valid(e) or e == moving_entity or e == ignored_blocker:
 				continue
 			if e.grid_position == tile:
 				return false
@@ -694,12 +747,20 @@ func _find_bfs_path(
 	goal_tile: Vector2i,
 	moving_entity = null,
 	treat_player_as_blocked: bool = true,
-	treat_other_enemies_as_blocked: bool = true
+	treat_other_enemies_as_blocked: bool = true,
+	ignore_destructible_objects: bool = false
 ) -> Array[Vector2i]:
 	var path: Array[Vector2i] = []
 	if start_tile == goal_tile:
 		return path
-	if not _is_tile_walkable(goal_tile, moving_entity, treat_player_as_blocked, treat_other_enemies_as_blocked):
+	if not _is_tile_walkable(
+		goal_tile,
+		moving_entity,
+		treat_player_as_blocked,
+		treat_other_enemies_as_blocked,
+		null,
+		ignore_destructible_objects
+	):
 		return path
 
 	var came_from: Dictionary = {start_tile: start_tile}
@@ -717,7 +778,14 @@ func _find_bfs_path(
 			var next_tile := current + direction
 			if came_from.has(next_tile):
 				continue
-			if not _is_tile_walkable(next_tile, moving_entity, treat_player_as_blocked, treat_other_enemies_as_blocked):
+			if not _is_tile_walkable(
+				next_tile,
+				moving_entity,
+				treat_player_as_blocked,
+				treat_other_enemies_as_blocked,
+				null,
+				ignore_destructible_objects
+			):
 				continue
 
 			came_from[next_tile] = current
@@ -739,7 +807,8 @@ func _find_path_to_nearest_goal(
 	goal_tiles: Array[Vector2i],
 	moving_entity = null,
 	treat_player_as_blocked: bool = true,
-	treat_other_enemies_as_blocked: bool = true
+	treat_other_enemies_as_blocked: bool = true,
+	ignore_destructible_objects: bool = false
 ) -> Array[Vector2i]:
 	var best_path: Array[Vector2i] = []
 	var found_path := false
@@ -750,7 +819,8 @@ func _find_path_to_nearest_goal(
 			goal_tile,
 			moving_entity,
 			treat_player_as_blocked,
-			treat_other_enemies_as_blocked
+			treat_other_enemies_as_blocked,
+			ignore_destructible_objects
 		)
 		if path.is_empty():
 			continue
@@ -761,11 +831,12 @@ func _find_path_to_nearest_goal(
 	return best_path
 
 
-func _find_enemy_path_to_target(
+func _find_enemy_path_to_attack_tile(
 	enemy: Enemy,
 	target_tile: Vector2i,
 	treat_other_enemies_as_blocked: bool = true,
-	log_debug: bool = false
+	log_debug: bool = false,
+	ignore_destructible_objects: bool = false
 ) -> Array[Vector2i]:
 	var path: Array[Vector2i] = []
 	if enemy == null or not is_instance_valid(enemy):
@@ -777,7 +848,8 @@ func _find_enemy_path_to_target(
 		goal_tiles,
 		enemy,
 		true,
-		treat_other_enemies_as_blocked
+		treat_other_enemies_as_blocked,
+		ignore_destructible_objects
 	)
 
 	var found_goal := not path.is_empty()
@@ -785,6 +857,22 @@ func _find_enemy_path_to_target(
 	if log_debug:
 		_debug_log_enemy_path(enemy, best_goal_tile, path, found_goal)
 	return path
+
+
+func _find_enemy_path_to_target(
+	enemy: Enemy,
+	target_tile: Vector2i,
+	treat_other_enemies_as_blocked: bool = true,
+	log_debug: bool = false,
+	ignore_destructible_objects: bool = false
+) -> Array[Vector2i]:
+	return _find_enemy_path_to_attack_tile(
+		enemy,
+		target_tile,
+		treat_other_enemies_as_blocked,
+		log_debug,
+		ignore_destructible_objects
+	)
 
 
 func _grid_to_world_center(tile: Vector2i) -> Vector2:
@@ -844,6 +932,310 @@ func _move_enemy_along_path(enemy: Enemy, path: Array[Vector2i], movement_allowa
 	return steps_taken
 
 
+func _is_enemy_attack_target_valid(target: Node2D) -> bool:
+	if target == null or not is_instance_valid(target):
+		return false
+	if target == player:
+		return player.hp > 0
+	if target is Enemy:
+		return target.state == Enemy.State.ALIVE
+	if target is EnvironmentObject:
+		return target.hp > 0
+	return false
+
+
+func _enemy_can_attack_target(enemy: Enemy, target: Node2D) -> bool:
+	if enemy == null or not is_instance_valid(enemy):
+		return false
+	if enemy.state != Enemy.State.ALIVE:
+		return false
+	if not _is_enemy_attack_target_valid(target):
+		return false
+	return _get_grid_target_position(target) in enemy.get_threatened_tiles()
+
+
+func _enemy_can_attack_player(enemy: Enemy) -> bool:
+	return _enemy_can_attack_target(enemy, player)
+
+
+func _enemy_try_attack_target(enemy: Enemy, target: Node2D) -> bool:
+	if not _enemy_can_attack_target(enemy, target):
+		return false
+	if not enemy.spend_energy(enemy.get_attack_energy_cost()):
+		return false
+
+	_damage_entity(target, enemy.damage)
+	if target == player and player.hiding:
+		player.become_hidden_or_revealed()
+	return true
+
+
+func _enemy_try_attack_player(enemy: Enemy) -> bool:
+	return _enemy_try_attack_target(enemy, player)
+
+
+func _enemy_can_use_special_action(_enemy: Enemy) -> bool:
+	if _enemy == null or not is_instance_valid(_enemy):
+		return false
+	return false
+
+
+func _try_enemy_special_action(_enemy: Enemy) -> Dictionary:
+	if not _enemy_can_use_special_action(_enemy):
+		return {"performed": false, "message": ""}
+	return {"performed": false, "message": ""}
+
+
+func _move_enemy_with_energy_budget(enemy: Enemy, path: Array[Vector2i], movement_allowance: int) -> int:
+	if enemy == null or not is_instance_valid(enemy):
+		return 0
+	if movement_allowance <= 0 or path.is_empty():
+		return 0
+
+	var move_cost := enemy.get_movement_energy_cost()
+	if move_cost <= 0:
+		return 0
+
+	var affordable_steps := int(floor(float(enemy.current_energy) / float(move_cost)))
+	if affordable_steps <= 0:
+		return 0
+
+	var allowed_steps: int = min(movement_allowance, affordable_steps)
+	var moved_steps := await _move_enemy_along_path(enemy, path, allowed_steps)
+	if moved_steps <= 0:
+		return 0
+
+	enemy.spend_energy(enemy.get_movement_energy_cost(moved_steps))
+	return moved_steps
+
+
+func _make_enemy_combat_plan(
+	kind: StringName,
+	target: Node2D = null,
+	path: Array[Vector2i] = []
+) -> Dictionary:
+	return {
+		"kind": kind,
+		"target": target,
+		"path": path
+	}
+
+
+func _make_enemy_action_result(
+	acted: bool,
+	message: String = "",
+	attacked: bool = false,
+	moved: bool = false
+) -> Dictionary:
+	return {
+		"acted": acted,
+		"message": message,
+		"attacked": attacked,
+		"moved": moved
+	}
+
+
+func _get_enemy_plan_kind(plan: Dictionary) -> StringName:
+	return StringName(plan.get("kind", ENEMY_COMBAT_PLAN_HOLD))
+
+
+func _get_enemy_plan_path(plan: Dictionary) -> Array[Vector2i]:
+	var resolved_path: Array[Vector2i] = []
+	var raw_path: Variant = plan.get("path", [])
+	if raw_path is Array:
+		for raw_tile in raw_path:
+			var tile: Vector2i = raw_tile
+			resolved_path.append(tile)
+	return resolved_path
+
+
+func _is_enemy_fallback_object_target(target: EnvironmentObject) -> bool:
+	if target == null or not is_instance_valid(target):
+		return false
+	return target.is_destructible and target.blocks_movement and target.hp > 0
+
+
+func _build_enemy_player_plan(enemy: Enemy) -> Dictionary:
+	if _enemy_can_attack_player(enemy):
+		return _make_enemy_combat_plan(ENEMY_COMBAT_PLAN_PLAYER, player)
+
+	var player_path: Array[Vector2i] = _find_enemy_path_to_attack_tile(enemy, player.grid_position, true, true)
+	if player_path.is_empty():
+		return {}
+	return _make_enemy_combat_plan(ENEMY_COMBAT_PLAN_PLAYER, player, player_path)
+
+
+func _build_enemy_destructible_object_fallback_plan(enemy: Enemy) -> Dictionary:
+	var can_move_this_turn: bool = enemy.can_afford_action(enemy.get_movement_energy_cost())
+	var can_attack_this_turn: bool = enemy.can_afford_action(enemy.get_attack_energy_cost())
+	if not can_move_this_turn and not can_attack_this_turn:
+		return {}
+
+	var unobstructed_player_path: Array[Vector2i] = _find_enemy_path_to_attack_tile(
+		enemy,
+		player.grid_position,
+		true,
+		false,
+		true
+	)
+	if unobstructed_player_path.is_empty():
+		return {}
+
+	var best_target: EnvironmentObject = null
+	var best_path: Array[Vector2i] = []
+	var best_is_adjacent_attack: bool = false
+	var best_path_length: int = 0
+	var best_player_distance: int = 0
+
+	for raw_target in object_layer.values():
+		var target: EnvironmentObject = raw_target as EnvironmentObject
+		if not _is_enemy_fallback_object_target(target):
+			continue
+
+		var target_tile: Vector2i = target.grid_position
+		var target_player_distance: int = abs(target_tile.x - player.grid_position.x) + abs(target_tile.y - player.grid_position.y)
+		var can_attack_target_now: bool = _enemy_can_attack_target(enemy, target)
+		if can_attack_target_now:
+			if not can_attack_this_turn:
+				continue
+			if best_target == null or not best_is_adjacent_attack or target_player_distance < best_player_distance:
+				best_target = target
+				best_path = []
+				best_is_adjacent_attack = true
+				best_path_length = 0
+				best_player_distance = target_player_distance
+			continue
+
+		if not can_move_this_turn:
+			continue
+
+		var target_path: Array[Vector2i] = _find_enemy_path_to_attack_tile(enemy, target_tile, true)
+		if target_path.is_empty():
+			continue
+
+		var path_length: int = target_path.size()
+		if best_target == null \
+		or (not best_is_adjacent_attack and path_length < best_path_length) \
+		or (not best_is_adjacent_attack and path_length == best_path_length and target_player_distance < best_player_distance):
+			best_target = target
+			best_path = target_path
+			best_is_adjacent_attack = false
+			best_path_length = path_length
+			best_player_distance = target_player_distance
+
+	if best_target == null:
+		return {}
+	return _make_enemy_combat_plan(ENEMY_COMBAT_PLAN_DESTRUCTIBLE_OBJECT, best_target, best_path)
+
+
+func _choose_enemy_combat_plan(enemy: Enemy, player_attack_locked: bool = false) -> Dictionary:
+	var player_plan: Dictionary = _build_enemy_player_plan(enemy)
+	if not player_plan.is_empty():
+		return player_plan
+
+	if player_attack_locked:
+		return _make_enemy_combat_plan(ENEMY_COMBAT_PLAN_HOLD)
+
+	var fallback_plan: Dictionary = _build_enemy_destructible_object_fallback_plan(enemy)
+	if not fallback_plan.is_empty():
+		return fallback_plan
+
+	return _make_enemy_combat_plan(ENEMY_COMBAT_PLAN_HOLD)
+
+
+func _execute_enemy_engagement_plan(
+	enemy: Enemy,
+	target: Node2D,
+	path: Array[Vector2i],
+	attack_message: String,
+	move_message: String,
+	move_attack_message: String,
+	allow_attack: bool = true
+) -> Dictionary:
+	if allow_attack and _enemy_try_attack_target(enemy, target):
+		return _make_enemy_action_result(true, _consume_environment_messages(attack_message), true, false)
+
+	var moved_steps: int = await _move_enemy_with_energy_budget(enemy, path, enemy.get_movement_allowance())
+	if moved_steps <= 0:
+		return _make_enemy_action_result(false)
+
+	if allow_attack and _enemy_try_attack_target(enemy, target):
+		return _make_enemy_action_result(true, _consume_environment_messages(move_attack_message), true, true)
+	return _make_enemy_action_result(true, _consume_environment_messages(move_message), false, true)
+
+
+func _execute_enemy_obstacle_plan(enemy: Enemy, plan: Dictionary) -> Dictionary:
+	var target: EnvironmentObject = plan.get("target", null) as EnvironmentObject
+	var path: Array[Vector2i] = _get_enemy_plan_path(plan)
+	if target == null or not is_instance_valid(target):
+		return _make_enemy_action_result(false)
+
+	var object_name: String = _object_display_name(target)
+	return await _execute_enemy_engagement_plan(
+		enemy,
+		target,
+		path,
+		"Enemy attacks the %s for %d." % [object_name, enemy.damage],
+		"Enemy advances on the %s." % object_name,
+		"Enemy advances on the %s. Then hits it for %d." % [object_name, enemy.damage]
+	)
+
+
+func _resolve_enemy_combat_turn(enemy: Enemy) -> String:
+	if enemy == null or not is_instance_valid(enemy):
+		return ""
+
+	enemy.reset_combat_energy()
+	var special_result := _try_enemy_special_action(enemy)
+	if bool(special_result.get("performed", false)):
+		return String(special_result.get("message", "Enemy uses a special action."))
+
+	var action_messages: Array[String] = []
+	var player_attack_locked: bool = false
+	var safety_counter: int = 0
+
+	while enemy.current_energy > 0 and safety_counter < 4:
+		safety_counter += 1
+		var combat_plan: Dictionary = _choose_enemy_combat_plan(enemy, player_attack_locked)
+		var plan_kind: StringName = _get_enemy_plan_kind(combat_plan)
+		var action_result: Dictionary = _make_enemy_action_result(false)
+
+		match plan_kind:
+			ENEMY_COMBAT_PLAN_PLAYER:
+				var player_path: Array[Vector2i] = _get_enemy_plan_path(combat_plan)
+				action_result = await _execute_enemy_engagement_plan(
+					enemy,
+					player,
+					player_path,
+					"Enemy attacks for %d." % enemy.damage,
+					"Enemy advances.",
+					"Enemy advances. Then hits for %d." % enemy.damage,
+					not player_attack_locked
+				)
+			ENEMY_COMBAT_PLAN_DESTRUCTIBLE_OBJECT:
+				action_result = await _execute_enemy_obstacle_plan(enemy, combat_plan)
+			_:
+				break
+
+		if not bool(action_result.get("acted", false)):
+			break
+		if plan_kind == ENEMY_COMBAT_PLAN_PLAYER and bool(action_result.get("attacked", false)):
+			player_attack_locked = true
+
+		var action_message: String = String(action_result.get("message", ""))
+		if not action_message.is_empty():
+			action_messages.append(action_message)
+
+		if enemy == null or not is_instance_valid(enemy) or enemy.state != Enemy.State.ALIVE:
+			break
+		if mode != GameMode.COMBAT:
+			break
+
+	if action_messages.is_empty():
+		return "Enemy holds position."
+	return " ".join(action_messages)
+
+
 func _debug_log_enemy_path(enemy: Enemy, goal_tile: Vector2i, path: Array[Vector2i], found_goal: bool) -> void:
 	if not debug_enemy_pathfinding or enemy == null or not is_instance_valid(enemy):
 		return
@@ -858,13 +1250,104 @@ func _debug_log_enemy_path(enemy: Enemy, goal_tile: Vector2i, path: Array[Vector
 	print("Enemy path ", enemy.name, " -> ", goal_tile, ": ", " -> ".join(step_text))
 
 
-func _move_entity_to_tile(entity, target: Vector2i) -> bool:
-	if not _can_move_to_tile(target, entity):
+func _is_displacement_target_movable(target: Node2D) -> bool:
+	if target == null or not is_instance_valid(target):
 		return false
-	entity.set_grid_position(target)
-	if mode == GameMode.EXPLORATION:
-		_rebuild_enemy_threat_map()
+	if target == player:
+		return true
+	if target is Enemy:
+		return target.state == Enemy.State.ALIVE
+	if target is EnvironmentObject:
+		return target.is_movable
+	return false
+
+
+func _get_grid_target_position(target: Node2D) -> Vector2i:
+	if target == null or not is_instance_valid(target):
+		return Vector2i.ZERO
+	if target == player:
+		return player.grid_position
+	if target is Enemy:
+		return target.grid_position
+	if target is EnvironmentObject:
+		return target.grid_position
+	return Vector2i.ZERO
+
+
+func _can_move_grid_target_to_tile(target: Node2D, tile: Vector2i, ignored_blocker: Node2D = null) -> bool:
+	if target == null or not is_instance_valid(target):
+		return false
+	return _is_tile_walkable(tile, target, true, true, ignored_blocker)
+
+
+func _move_grid_target_to_tile(target: Node2D, tile: Vector2i, ignored_blocker: Node2D = null) -> bool:
+	if target == null or not is_instance_valid(target):
+		return false
+	if not _can_move_grid_target_to_tile(target, tile, ignored_blocker):
+		return false
+
+	var start_tile: Vector2i = _get_grid_target_position(target)
+	if target is EnvironmentObject:
+		if object_layer.get(start_tile) == target:
+			object_layer.erase(start_tile)
+		object_layer[tile] = target
+
+	if target == player:
+		player.set_grid_position(tile)
+	elif target is Enemy:
+		target.set_grid_position(tile)
+	elif target is EnvironmentObject:
+		target.set_grid_position(tile)
+	else:
+		return false
+
+	_rebuild_enemy_threat_map()
+	_resolve_entity_tile_entry(target)
+	queue_redraw()
 	return true
+
+
+func apply_displacement(
+	target: Node2D,
+	direction: Vector2i,
+	distance: int,
+	ignored_blocker: Node2D = null
+) -> Dictionary:
+	var result: Dictionary = {
+		"success": false,
+		"destination": Vector2i.ZERO,
+		"moved_distance": 0
+	}
+	if not _is_displacement_target_movable(target):
+		return result
+
+	var step_direction: Vector2i = direction.sign()
+	if abs(step_direction.x) + abs(step_direction.y) != 1:
+		return result
+	if distance <= 0:
+		return result
+
+	var start_tile: Vector2i = _get_grid_target_position(target)
+	var destination: Vector2i = start_tile
+	for _step in range(distance):
+		var next_tile: Vector2i = destination + step_direction
+		if not _can_move_grid_target_to_tile(target, next_tile, ignored_blocker):
+			return result
+		destination = next_tile
+
+	if destination == start_tile:
+		return result
+	if not _move_grid_target_to_tile(target, destination, ignored_blocker):
+		return result
+
+	result["success"] = true
+	result["destination"] = destination
+	result["moved_distance"] = distance
+	return result
+
+
+func _move_entity_to_tile(entity: Node2D, target: Vector2i) -> bool:
+	return _move_grid_target_to_tile(entity, target)
 
 
 func _move_player_one_tile(target: Vector2i) -> bool:
@@ -934,9 +1417,12 @@ func _start_combat(trigger_enemy: Enemy = null, trigger_reason: String = "") -> 
 	exploration_pending_combat = false
 	exploration_combat_trigger_enemy = trigger_enemy
 	exploration_combat_trigger_reason = trigger_reason
+	combat_transition_running = false
+	combat_transition_can_start = false
 	exploration_reserved_tiles.clear()
 	_pause_exploration_enemy_schedules(true)
 	mode = GameMode.COMBAT
+	Input.flush_buffered_events()
 	_rebuild_enemy_threat_map()
 	combat_turn = 1
 	message = _consume_environment_messages("Combat started. Draw 1 each turn, but your hand persists.")
@@ -1015,24 +1501,7 @@ func _enemy_take_turn() -> void:
 		if e == null or not is_instance_valid(e):
 			continue
 
-		if player.grid_position in e.get_threatened_tiles():
-			player.take_damage(e.damage)
-			if player.hiding:
-				player.become_hidden_or_revealed()
-			message = "Enemy attacks for %d." % e.damage
-		else:
-			var path := _find_enemy_path_to_target(e, player.grid_position, true, true)
-			if not path.is_empty():
-				message = "Enemy advances."
-				_update_message()
-			var moved_steps := await _move_enemy_along_path(e, path, e.get_movement_allowance())
-			if moved_steps > 0:
-				message = _consume_environment_messages(message)
-			elif path.is_empty():
-				message = _consume_environment_messages("Enemy holds position.")
-			if e != null and is_instance_valid(e) and player.grid_position in e.get_threatened_tiles():
-				player.take_damage(e.damage)
-				message += " Then hits for %d." % e.damage
+		message = await _resolve_enemy_combat_turn(e)
 
 		if e == null or not is_instance_valid(e):
 			_refresh_ui()
@@ -1146,8 +1615,6 @@ func _play_lunge() -> Dictionary:
 	if direction != Vector2i.ZERO:
 		var lunge_tile: Vector2i = player.grid_position + direction
 		if lunge_tile != current_target.grid_position and _move_entity_to_tile(player, lunge_tile):
-			_resolve_entity_tile_entry(player)
-			_rebuild_enemy_threat_map()
 			player_moved = true
 	if _is_adjacent(player.grid_position, current_target.grid_position):
 		var lunge_damage := _modify_attack_damage(6)
@@ -1177,12 +1644,19 @@ func _play_slip_past() -> Dictionary:
 	if not _has_valid_target():
 		return {"success": false, "message": "No target selected."}
 	if not _is_adjacent(player.grid_position, current_target.grid_position):
-		return {"success": false, "message": "Slip Past needs an adjacent enemy."}
-	var old_player_pos: Vector2i = player.grid_position
-	player.set_grid_position(current_target.grid_position)
-	current_target.set_grid_position(old_player_pos)
-	_resolve_entity_tile_entry(player)
-	_resolve_entity_tile_entry(current_target)
+		return {"success": false, "message": "Slip Past needs an adjacent target."}
+	if not _is_displacement_target_movable(current_target):
+		return {"success": false, "message": "That target cannot be displaced."}
+
+	var player_origin: Vector2i = player.grid_position
+	var target_origin: Vector2i = _get_grid_target_position(current_target)
+	var swap_direction: Vector2i = _step_toward(target_origin, player_origin)
+	var displacement_result: Dictionary = apply_displacement(current_target, swap_direction, 1, player)
+	if not bool(displacement_result.get("success", false)):
+		return {"success": false, "message": "No room to slip past."}
+	if not _move_grid_target_to_tile(player, target_origin):
+		return {"success": false, "message": "Slip Past failed to reposition you."}
+
 	return {"success": true, "message": _consume_environment_messages("Swapped positions.")}
 
 
@@ -1209,6 +1683,9 @@ func _check_end_of_combat() -> void:
 	exploration_pending_combat = false
 	exploration_combat_trigger_enemy = null
 	exploration_combat_trigger_reason = ""
+	combat_transition_running = false
+	combat_transition_can_start = false
+	suppress_next_move_input = false
 	exploration_reserved_tiles.clear()
 	_pause_exploration_enemy_schedules(false)
 	_set_current_target(null)
@@ -1222,12 +1699,20 @@ func _update_enemy_intent(e: Enemy) -> void:
 	if e == null or not is_instance_valid(e):
 		return
 	if mode == GameMode.COMBAT:
-		if _is_adjacent(player.grid_position, e.grid_position):
-			e.set_intent_text("Attack %d" % e.damage)
-		elif _find_enemy_path_to_target(e, player.grid_position, true).is_empty():
-			e.set_intent_text("Hold")
-		else:
-			e.set_intent_text("Advance")
+		var combat_plan: Dictionary = _choose_enemy_combat_plan(e)
+		var plan_kind: StringName = _get_enemy_plan_kind(combat_plan)
+		match plan_kind:
+			ENEMY_COMBAT_PLAN_PLAYER:
+				if _enemy_can_attack_player(e):
+					e.set_intent_text("Attack %d" % e.damage)
+				else:
+					e.set_intent_text("Advance")
+			ENEMY_COMBAT_PLAN_DESTRUCTIBLE_OBJECT:
+				var obstacle_target: EnvironmentObject = combat_plan.get("target", null) as EnvironmentObject
+				var obstacle_name: String = _object_display_name(obstacle_target).to_lower()
+				e.set_intent_text("Break %s" % obstacle_name)
+			_:
+				e.set_intent_text("Hold")
 	else:
 		match e.awareness_state:
 			Enemy.AwarenessState.ALERT:
@@ -1250,7 +1735,16 @@ func _update_all_enemy_intent() -> void:
 		_update_enemy_intent(e)
 
 
+func _sync_enemy_health_bar_visibility() -> void:
+	var show_bars: bool = mode == GameMode.COMBAT
+	for enemy in enemies:
+		if enemy == null or not is_instance_valid(enemy):
+			continue
+		enemy.set_health_bar_visible(show_bars)
+
+
 func _refresh_ui() -> void:
+	_sync_enemy_health_bar_visibility()
 	mode_label.text = "Mode: %s" % _mode_name()
 	stats_label.text = "HP %d/%d  Block %d  Energy %d/%d" % [
 		player.hp,
@@ -1259,6 +1753,7 @@ func _refresh_ui() -> void:
 		current_energy,
 		max_energy
 	]
+	combat_banner.visible = mode == GameMode.COMBAT_TRANSITION
 	controls_label.text = _controls_text()
 	_rebuild_hand()
 	_update_message()
@@ -1280,7 +1775,22 @@ func _rebuild_hand() -> void:
 
 
 func _update_message() -> void:
+	if mode == GameMode.COMBAT_TRANSITION:
+		center_message.text = _combat_transition_message()
+		return
 	center_message.text = message
+
+
+func _combat_transition_message() -> String:
+	var transition_message: String = "Exploration has ended. Combat rules are taking over."
+	if exploration_combat_trigger_reason.begins_with("enemy_detection:"):
+		transition_message = "You entered an enemy detection zone."
+	elif exploration_combat_trigger_reason.begins_with("player_"):
+		transition_message = "You engaged an enemy. Combat rules are taking over."
+
+	if combat_transition_can_start:
+		return "%s\nPress any key or click to begin." % transition_message
+	return transition_message
 
 
 func _controls_text() -> String:
@@ -1295,6 +1805,10 @@ func _controls_text() -> String:
 					return "Transitioning to combat."
 				_:
 					return "Explore with arrow keys/WASD. Press . or X to wait. Number keys can play any usable card."
+		GameMode.COMBAT_TRANSITION:
+			if combat_transition_can_start:
+				return "Combat is ready. Press any key or click to begin."
+			return "Combat is starting. Input is locked until the prompt appears."
 		GameMode.COMBAT:
 			if enemy_turn_in_progress:
 				return "Enemy turn: movement resolves one tile at a time."
@@ -1314,6 +1828,8 @@ func _mode_name() -> String:
 	match mode:
 		GameMode.EXPLORATION:
 			return "Exploration"
+		GameMode.COMBAT_TRANSITION:
+			return "Combat Transition"
 		GameMode.COMBAT:
 			return "Combat"
 		GameMode.VICTORY:
@@ -1661,11 +2177,18 @@ func _build_enemy_patrol_action(enemy: Enemy) -> Dictionary:
 	if enemy.grid_position == target:
 		return action
 
-	var path := _find_bfs_path(enemy.grid_position, target, enemy, true, true)
+	var path := _find_bfs_path(enemy.grid_position, target, enemy, false, true)
 	if path.is_empty():
 		return action
 
 	var next_tile: Vector2i = path[0]
+	var move_direction: Vector2i = (next_tile - enemy.grid_position).sign()
+	if abs(move_direction.x) + abs(move_direction.y) != 1:
+		return action
+	if move_direction != enemy.facing_dir:
+		action["kind"] = "rotate"
+		action["facing"] = move_direction
+		return action
 	if not _can_move_to_tile(next_tile, enemy):
 		return action
 
@@ -1832,18 +2355,49 @@ func _queue_exploration_combat_transition(trigger_enemy: Enemy, trigger_reason: 
 	exploration_pending_combat = true
 	exploration_combat_trigger_enemy = trigger_enemy
 	exploration_combat_trigger_reason = trigger_reason
-	_refresh_exploration_state()
+	combat_transition_running = false
+	combat_transition_can_start = false
+	mode = GameMode.COMBAT_TRANSITION
+	_pause_exploration_enemy_schedules(true)
+	Input.flush_buffered_events()
+	_rebuild_enemy_threat_map()
+	_refresh_ui()
+	queue_redraw()
+	_flush_pending_exploration_transition_if_ready()
 
 
 func _flush_pending_exploration_transition_if_ready() -> void:
 	if not exploration_pending_combat:
 		return
-	if mode != GameMode.EXPLORATION:
+	if mode != GameMode.COMBAT_TRANSITION:
 		return
 	if exploration_active_presentations > 0 or player_move_in_progress:
 		return
+	if combat_transition_can_start:
+		return
+	if combat_transition_running:
+		return
 
-	_start_combat(exploration_combat_trigger_enemy, exploration_combat_trigger_reason)
+	combat_transition_running = true
+	_run_combat_transition()
+
+
+func _run_combat_transition() -> void:
+	_refresh_ui()
+	queue_redraw()
+
+	if combat_transition_prompt_delay > 0.0:
+		var prompt_timer: SceneTreeTimer = get_tree().create_timer(combat_transition_prompt_delay)
+		await prompt_timer.timeout
+
+	if not exploration_pending_combat or mode != GameMode.COMBAT_TRANSITION:
+		combat_transition_running = false
+		return
+
+	combat_transition_can_start = true
+	combat_transition_running = false
+	_refresh_ui()
+	queue_redraw()
 
 
 func _enemy_detects_player(enemy: Enemy) -> bool:

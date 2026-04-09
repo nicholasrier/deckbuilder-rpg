@@ -9,3 +9,4 @@ func _ready() -> void:
 	hp = max_hp
 	is_destructible = true
 	is_targetable = true
+	is_movable = true
