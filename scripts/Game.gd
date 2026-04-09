@@ -40,12 +40,20 @@ enum GameMode {
 	DEFEAT
 }
 
+enum ExplorationState {
+	WAITING_FOR_PLAYER_INPUT,
+	PLAYER_ACTION_RESOLVING,
+	ENEMY_ACTION_RESOLVING,
+	TRANSITIONING_TO_COMBAT
+}
+
 @export var EnemyScene: PackedScene
 @export var debug_enemy_pathfinding := false
 @export_range(0.0, 0.5, 0.01) var enemy_step_duration := 0.18
 @export var debug_enemy_step_logging := false
 @export_range(0.0, 0.5, 0.01) var player_step_duration := 0.12
 @export var debug_player_step_logging := false
+@export_range(0.0, 0.5, 0.01) var enemy_rotation_duration := 0.08
 
 @onready var player = $Player
 
@@ -73,6 +81,13 @@ var object_layer: Dictionary = {}
 var pending_environment_messages: Array[String] = []
 var enemy_turn_in_progress := false
 var player_move_in_progress := false
+var exploration_state := ExplorationState.WAITING_FOR_PLAYER_INPUT
+var exploration_reserved_tiles: Dictionary = {}
+var exploration_enemy_timers: Dictionary = {}
+var exploration_active_presentations := 0
+var exploration_pending_combat := false
+var exploration_combat_trigger_enemy: Enemy = null
+var exploration_combat_trigger_reason := ""
 
 
 func mark_threat_tile(tile: Vector2i) -> void:
@@ -89,6 +104,36 @@ func is_tile_threatened(tile: Vector2i) -> bool:
 
 func is_player_in_threat() -> bool:
 	return is_tile_threatened(player.grid_position)
+
+
+func _set_exploration_state(next_state: int) -> void:
+	exploration_state = next_state
+
+
+func _rebuild_enemy_threat_map() -> void:
+	_build_threat_map(enemies)
+
+
+func _refresh_exploration_state() -> void:
+	if mode != GameMode.EXPLORATION:
+		return
+	if exploration_pending_combat:
+		_set_exploration_state(ExplorationState.TRANSITIONING_TO_COMBAT)
+	elif player_move_in_progress:
+		_set_exploration_state(ExplorationState.PLAYER_ACTION_RESOLVING)
+	elif exploration_active_presentations > 0:
+		_set_exploration_state(ExplorationState.ENEMY_ACTION_RESOLVING)
+	else:
+		_set_exploration_state(ExplorationState.WAITING_FOR_PLAYER_INPUT)
+
+
+func _pause_exploration_enemy_schedules(paused: bool) -> void:
+	for timer in exploration_enemy_timers.values():
+		if timer == null or not is_instance_valid(timer):
+			continue
+		timer.paused = paused
+		if not paused and timer.is_stopped():
+			timer.start()
 
 
 func _get_nearest_enemy() -> Enemy:
@@ -109,18 +154,15 @@ func _get_nearest_enemy() -> Enemy:
 
 func _on_enemy_died(the_enemy: Enemy) -> void:
 	_handle_destroyed_target(the_enemy)
+	_clear_exploration_reservations_for(the_enemy)
+	_remove_enemy_exploration_timer(the_enemy)
 
 	enemies.erase(the_enemy)
 	the_enemy.hide()
 	the_enemy.queue_free()
-	_build_threat_map(enemies)
+	_rebuild_enemy_threat_map()
+	_update_all_enemy_intent()
 	_check_end_of_combat()
-
-
-@warning_ignore("unused_parameter")
-func _on_enemy_moved(the_enemy: Enemy) -> void:
-	_build_threat_map(enemies)
-	queue_redraw()
 
 
 func _on_enemy_intent_changed(_enemy: Enemy, _new_intent: String) -> void:
@@ -146,16 +188,30 @@ func _on_environment_object_destroyed(obj) -> void:
 func _ready() -> void:
 	_setup_input_map()
 	_setup_environment_layers()
-	_spawn_enemy(EnemyScene, Vector2i(6, 3))
-	_spawn_enemy(EnemyScene, Vector2i(6, 1))
+	var patrol_enemy := _spawn_enemy(EnemyScene, Vector2i(6, 3))
+	patrol_enemy.exploration_cadence = 0.85
+	setup_enemy_patrol(patrol_enemy, patrol_enemy.grid_position, Vector2i.RIGHT, 3, Enemy.Patrol_Mode.LOOP)
+
+	var sentry_enemy := _spawn_enemy(EnemyScene, Vector2i(6, 1))
+	sentry_enemy.exploration_cadence = 1.15
+	setup_enemy_rotation_sentry(
+		sentry_enemy,
+		[
+			Vector2i.LEFT,
+			Vector2i.UP,
+			Vector2i.RIGHT,
+			Vector2i.DOWN
+		]
+	)
 	player.set_grid_position(Vector2i(1, 3))
-	_build_threat_map(enemies)
+	_rebuild_enemy_threat_map()
 	_update_all_enemy_intent()
+	_start_exploration_enemy_schedules()
 	deck_manager.setup(CardDatabaseScript.make_starter_deck())
 	_draw_cards_with_shared_rules(5)
 	current_energy = max_energy
-	
-	
+	_refresh_exploration_state()
+
 	_update_message()
 	_refresh_ui()
 	queue_redraw()
@@ -232,18 +288,30 @@ func _draw_tile_overlay(tile: Vector2i, tile_pos: Vector2) -> void:
 		)
 
 
-func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> void:
+func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> Enemy:
 	var e := scene.instantiate() as Enemy
 	e.set_grid_position(pos)
 	e.died.connect(_on_enemy_died)
-	e.moved.connect(_on_enemy_moved)
 	e.intent_changed.connect(_on_enemy_intent_changed)
 	add_child(e)
 	enemies.append(e)
 	targets.append(e)
+	_ensure_enemy_exploration_timer(e)
+	return e
+
+
+func _is_input_locked() -> bool:
+	if mode == GameMode.EXPLORATION:
+		return exploration_pending_combat or player_move_in_progress
+	return enemy_turn_in_progress or player_move_in_progress
+
+
+func _is_movement_locked() -> bool:
+	return _is_input_locked()
+
 
 func _input(event: InputEvent) -> void:
-	if enemy_turn_in_progress or player_move_in_progress:
+	if _is_input_locked():
 		return
 
 	if event is InputEventMouseButton \
@@ -274,7 +342,11 @@ func _is_pointer_over_card_ui() -> bool:
 
 
 func _unhandled_input(event: InputEvent) -> void:
-	if enemy_turn_in_progress or player_move_in_progress:
+	if _is_input_locked():
+		return
+
+	if mode == GameMode.EXPLORATION and event.is_action_pressed("wait"):
+		_try_exploration_wait()
 		return
 
 	if event.is_action_pressed("end_turn"):
@@ -461,7 +533,7 @@ func damage_object_at(tile: Vector2i, amount: int) -> void:
 
 
 func _process(_delta: float) -> void:
-	if enemy_turn_in_progress or player_move_in_progress:
+	if _is_movement_locked():
 		return
 
 	var move_dir := _read_move_input()
@@ -484,6 +556,7 @@ func _setup_input_map() -> void:
 	_ensure_action("move_down", KEY_S, KEY_DOWN)
 	_ensure_action("move_left", KEY_A, KEY_LEFT)
 	_ensure_action("move_right", KEY_D, KEY_RIGHT)
+	_ensure_action("wait", KEY_PERIOD, KEY_X)
 	_ensure_action("end_turn", KEY_SPACE)
 	_ensure_action("card_1", KEY_1)
 	_ensure_action("card_2", KEY_2)
@@ -525,25 +598,33 @@ func _read_move_input() -> Vector2i:
 
 
 func _try_exploration_move(direction: Vector2i) -> void:
+	if must_resolve_overflow:
+		message = "Hand overflow: play or discard a card first."
+		_update_message()
+		return
 	var target: Vector2i = player.grid_position + direction
 	if not await _move_player_one_tile(target):
 		return
-
-	if player.hp <= 0:
-		_finish_environment_message("You were overwhelmed.")
-		mode = GameMode.DEFEAT
-		_refresh_ui()
-		queue_redraw()
+	if mode != GameMode.EXPLORATION:
 		return
 
-	if not enemies.is_empty():
-		if is_player_in_threat():
-			_start_combat()
-			return
-		message = _consume_environment_messages("Exploration: close the gap to trigger combat.")
-	else:
-		message = _consume_environment_messages("Moved to %s." % [str(player.grid_position)])
+	var resolved_message := _consume_environment_messages("Moved to %s." % [str(player.grid_position)])
+	if not resolved_message.is_empty():
+		message = resolved_message
+	_refresh_ui()
+	queue_redraw()
 
+
+func _try_exploration_wait() -> void:
+	if must_resolve_overflow:
+		message = "Hand overflow: play or discard a card first."
+		_update_message()
+		return
+	message = "You wait."
+	_resolve_exploration_detection("player_wait")
+	_flush_pending_exploration_transition_if_ready()
+	if mode != GameMode.EXPLORATION:
+		return
 	_refresh_ui()
 	queue_redraw()
 
@@ -574,6 +655,9 @@ func _is_tile_walkable(
 
 	var obj = get_object_at(tile)
 	if obj != null and bool(obj.blocks_movement):
+		return false
+
+	if mode == GameMode.EXPLORATION and _is_tile_reserved_by_other(tile, moving_entity):
 		return false
 
 	if treat_player_as_blocked and player != moving_entity and player.grid_position == tile:
@@ -730,6 +814,7 @@ func _move_enemy_one_tile(enemy: Enemy, next_tile: Vector2i) -> bool:
 			return false
 
 	enemy.set_grid_position(next_tile)
+	_rebuild_enemy_threat_map()
 	_resolve_entity_tile_entry(enemy)
 	if enemy == null or not is_instance_valid(enemy):
 		return false
@@ -777,6 +862,8 @@ func _move_entity_to_tile(entity, target: Vector2i) -> bool:
 	if not _can_move_to_tile(target, entity):
 		return false
 	entity.set_grid_position(target)
+	if mode == GameMode.EXPLORATION:
+		_rebuild_enemy_threat_map()
 	return true
 
 
@@ -794,15 +881,34 @@ func _move_player_one_tile(target: Vector2i) -> bool:
 		else:
 			print("Player step: ", player.grid_position, " -> ", target, " through ", step_hazard)
 
+	var start_tile: Vector2i= player.grid_position
 	var target_position := _grid_to_world_center(target)
+	_reserve_exploration_motion(player, start_tile, target)
+	player.set_grid_position(target, false)
+	exploration_active_presentations += 1
+	_refresh_exploration_state()
 	if player_step_duration > 0.0:
 		var tween := create_tween()
 		tween.tween_property(player, "position", target_position, player_step_duration)
 		await tween.finished
 
-	player.set_grid_position(target)
+	player.position = target_position
+	exploration_active_presentations = max(exploration_active_presentations - 1, 0)
+	_clear_exploration_reservations_for(player)
 	_resolve_entity_tile_entry(player)
+	if player.hp <= 0:
+		player_move_in_progress = false
+		_refresh_exploration_state()
+		_finish_environment_message("You were overwhelmed.")
+		mode = GameMode.DEFEAT
+		_refresh_ui()
+		queue_redraw()
+		return true
+	_rebuild_enemy_threat_map()
+	_resolve_exploration_detection("player_move")
 	player_move_in_progress = false
+	_flush_pending_exploration_transition_if_ready()
+	_refresh_exploration_state()
 	return true
 
 
@@ -824,8 +930,14 @@ func _try_combat_move(direction: Vector2i) -> void:
 	queue_redraw()
 
 
-func _start_combat() -> void:
+func _start_combat(trigger_enemy: Enemy = null, trigger_reason: String = "") -> void:
+	exploration_pending_combat = false
+	exploration_combat_trigger_enemy = trigger_enemy
+	exploration_combat_trigger_reason = trigger_reason
+	exploration_reserved_tiles.clear()
+	_pause_exploration_enemy_schedules(true)
 	mode = GameMode.COMBAT
+	_rebuild_enemy_threat_map()
 	combat_turn = 1
 	message = _consume_environment_messages("Combat started. Draw 1 each turn, but your hand persists.")
 	_begin_player_turn(false)
@@ -834,6 +946,7 @@ func _start_combat() -> void:
 func _begin_player_turn(draw_card: bool = true) -> void:
 	enemy_turn_in_progress = false
 	player_move_in_progress = false
+	exploration_reserved_tiles.clear()
 	player.reset_turn_state()
 	current_energy = max_energy
 	movement_left = PLAYER_SPEED
@@ -875,8 +988,30 @@ func _end_player_turn() -> void:
 	_update_message()
 
 
+func _get_enemy_combat_turn_order() -> Array[Enemy]:
+	var ordered_enemies: Array[Enemy] = []
+
+	for enemy in enemies:
+		if enemy == null or not is_instance_valid(enemy):
+			continue
+
+		var enemy_distance : float = abs(enemy.grid_position.x - player.grid_position.x) + abs(enemy.grid_position.y - player.grid_position.y)
+		var insert_at := ordered_enemies.size()
+
+		for index in range(ordered_enemies.size()):
+			var other_enemy := ordered_enemies[index]
+			var other_distance :float = abs(other_enemy.grid_position.x - player.grid_position.x) + abs(other_enemy.grid_position.y - player.grid_position.y)
+			if enemy_distance < other_distance:
+				insert_at = index
+				break
+
+		ordered_enemies.insert(insert_at, enemy)
+
+	return ordered_enemies
+
+
 func _enemy_take_turn() -> void:
-	for e in enemies.duplicate():
+	for e in _get_enemy_combat_turn_order():
 		if e == null or not is_instance_valid(e):
 			continue
 
@@ -922,7 +1057,7 @@ func _enemy_take_turn() -> void:
 
 
 func _handle_card_shortcut(index: int) -> void:
-	if enemy_turn_in_progress or player_move_in_progress:
+	if _is_input_locked():
 		return
 	if index >= deck_manager.hand.size():
 		return
@@ -988,8 +1123,11 @@ func _play_strike() -> Dictionary:
 		return {"success": false, "message": "No target selected."}
 	if not _is_adjacent(player.grid_position, current_target.grid_position):
 		return {"success": false, "message": "Strike needs an adjacent enemy."}
+	var target_enemy := current_target as Enemy
 	var damage := _modify_attack_damage(6)
 	current_target.take_damage(damage)
+	if mode == GameMode.EXPLORATION and target_enemy != null and is_instance_valid(target_enemy):
+		_try_player_initiated_exploration_combat(target_enemy, "player_strike")
 	return {"success": true, "message": "Dealt %d damage." % damage}
 
 
@@ -1002,17 +1140,24 @@ func _play_lunge() -> Dictionary:
 	if not _has_valid_target():
 		return {"success": false, "message": "No target selected."}
 
+	var player_moved := false
+	var target_enemy := current_target as Enemy
 	var direction := _step_toward(player.grid_position, current_target.grid_position)
 	if direction != Vector2i.ZERO:
 		var lunge_tile: Vector2i = player.grid_position + direction
 		if lunge_tile != current_target.grid_position and _move_entity_to_tile(player, lunge_tile):
 			_resolve_entity_tile_entry(player)
+			_rebuild_enemy_threat_map()
+			player_moved = true
 	if _is_adjacent(player.grid_position, current_target.grid_position):
 		var lunge_damage := _modify_attack_damage(6)
 		current_target.take_damage(lunge_damage)
-		if player.grid_position in threatened_tiles:
-			_start_combat()
+		if mode == GameMode.EXPLORATION and target_enemy != null and is_instance_valid(target_enemy):
+			_try_player_initiated_exploration_combat(target_enemy, "player_lunge")
 		return {"success": true, "message": _consume_environment_messages("Closed in and dealt %d damage." % lunge_damage)}
+	if player_moved and mode == GameMode.EXPLORATION:
+		_resolve_exploration_detection("player_lunge_move")
+		_flush_pending_exploration_transition_if_ready()
 	return {"success": true, "message": _consume_environment_messages("Moved closer, but no hit.")}
 
 
@@ -1061,12 +1206,21 @@ func _check_end_of_combat() -> void:
 	if not enemies.is_empty():
 		return
 	mode = GameMode.EXPLORATION
+	exploration_pending_combat = false
+	exploration_combat_trigger_enemy = null
+	exploration_combat_trigger_reason = ""
+	exploration_reserved_tiles.clear()
+	_pause_exploration_enemy_schedules(false)
 	_set_current_target(null)
+	_rebuild_enemy_threat_map()
+	_refresh_exploration_state()
 	message = _consume_environment_messages("")
 	_update_message()
 
 
 func _update_enemy_intent(e: Enemy) -> void:
+	if e == null or not is_instance_valid(e):
+		return
 	if mode == GameMode.COMBAT:
 		if _is_adjacent(player.grid_position, e.grid_position):
 			e.set_intent_text("Attack %d" % e.damage)
@@ -1075,7 +1229,18 @@ func _update_enemy_intent(e: Enemy) -> void:
 		else:
 			e.set_intent_text("Advance")
 	else:
-		e.set_intent_text("Patrol")
+		match e.awareness_state:
+			Enemy.AwarenessState.ALERT:
+				e.set_intent_text("Alert")
+			Enemy.AwarenessState.SUSPICIOUS:
+				e.set_intent_text("Suspicious")
+			_:
+				if e.has_patrol_route():
+					e.set_intent_text("Patrol")
+				elif e.has_rotation_route():
+					e.set_intent_text("Rotate")
+				else:
+					e.set_intent_text("Hold")
 
 
 func _update_all_enemy_intent() -> void:
@@ -1109,7 +1274,7 @@ func _rebuild_hand() -> void:
 		button.custom_minimum_size = Vector2(150, 96)
 		button.text = "%d. %s\nCost %d\n%s" % [i + 1, card["name"], card["cost"], card["text"]]
 		button.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		button.disabled = mode == GameMode.DEFEAT or mode == GameMode.VICTORY or enemy_turn_in_progress or player_move_in_progress
+		button.disabled = mode == GameMode.DEFEAT or mode == GameMode.VICTORY or _is_input_locked()
 		button.pressed.connect(func() -> void: _handle_card_shortcut(card_index))
 		hand_box.add_child(button)
 
@@ -1121,7 +1286,15 @@ func _update_message() -> void:
 func _controls_text() -> String:
 	match mode:
 		GameMode.EXPLORATION:
-			return "Explore with arrow keys/WASD. Walk into the enemy to trigger combat. Number keys can play any usable card."
+			match exploration_state:
+				ExplorationState.PLAYER_ACTION_RESOLVING:
+					return "Resolving your exploration action."
+				ExplorationState.ENEMY_ACTION_RESOLVING:
+					return "Enemies are resolving their patrols."
+				ExplorationState.TRANSITIONING_TO_COMBAT:
+					return "Transitioning to combat."
+				_:
+					return "Explore with arrow keys/WASD. Press . or X to wait. Number keys can play any usable card."
 		GameMode.COMBAT:
 			if enemy_turn_in_progress:
 				return "Enemy turn: movement resolves one tile at a time."
@@ -1161,7 +1334,8 @@ func _build_threat_map(foes: Array[Enemy]) -> void:
 		if f == null or not is_instance_valid(f):
 			continue
 
-		for tile in f.get_threatened_tiles():
+		var tiles := f.get_threatened_tiles() if mode == GameMode.COMBAT else _get_enemy_detection_tiles(f)
+		for tile in tiles:
 			threatened_tiles[tile] = true
 
 	queue_redraw()
@@ -1325,3 +1499,417 @@ func _step_toward(from_tile: Vector2i, to_tile: Vector2i) -> Vector2i:
 		return Vector2i(int(sign(delta.x)), 0)
 
 	return Vector2i.ZERO
+
+#Exploration Logic --------------------------
+func build_linear_patrol_points(
+	start: Vector2i,
+	direction: Vector2i,
+	distance: int
+) -> Array[Vector2i]:
+	var points: Array[Vector2i] = []
+	var dir := direction.sign()
+
+	if abs(dir.x) + abs(dir.y) != 1:
+		push_error("Direction must be cardinal.")
+		return points
+
+	points.append(start)
+
+	for i in range(1, distance + 1):
+		var point: Vector2i = start + dir * i
+		if not _is_tile_walkable(point, null, false, false):
+			break
+		points.append(point)
+
+	return points
+
+
+func setup_enemy_patrol(
+	enemy: Enemy,
+	start: Vector2i,
+	direction: Vector2i,
+	distance: int,
+	patrol_mode: Enemy.Patrol_Mode
+) -> void:
+	if enemy == null or not is_instance_valid(enemy):
+		return
+
+	var facing := direction.sign()
+	if abs(facing.x) + abs(facing.y) != 1:
+		facing = enemy.facing_dir
+
+	enemy.clear_patrol()
+	enemy.clear_rotation_route()
+	enemy.patrol_mode = patrol_mode
+	enemy.facing_dir = facing
+
+	match patrol_mode:
+		Enemy.Patrol_Mode.SENTRY:
+			enemy.patrol_points = [start]
+		Enemy.Patrol_Mode.PINGPONG, Enemy.Patrol_Mode.LOOP:
+			enemy.patrol_points = build_linear_patrol_points(start, facing, distance)
+
+	if enemy.patrol_points.is_empty():
+		enemy.patrol_points = [start]
+
+	enemy.patrol_index = 0
+	enemy.patrol_forward = true
+
+
+func setup_enemy_rotation_sentry(enemy: Enemy, directions: Array[Vector2i]) -> void:
+	if enemy == null or not is_instance_valid(enemy):
+		return
+
+	enemy.clear_patrol()
+	enemy.patrol_mode = Enemy.Patrol_Mode.SENTRY
+	enemy.set_rotation_route(directions)
+
+
+func _start_exploration_enemy_schedules() -> void:
+	for enemy in enemies:
+		_ensure_enemy_exploration_timer(enemy)
+	_pause_exploration_enemy_schedules(false)
+
+
+func _ensure_enemy_exploration_timer(enemy: Enemy) -> void:
+	if enemy == null or not is_instance_valid(enemy):
+		return
+
+	var timer := exploration_enemy_timers.get(enemy, null) as Timer
+	if timer == null or not is_instance_valid(timer):
+		timer = Timer.new()
+		timer.one_shot = false
+		timer.autostart = false
+		timer.timeout.connect(_on_enemy_exploration_timer_timeout.bind(enemy))
+		add_child(timer)
+		exploration_enemy_timers[enemy] = timer
+
+	timer.wait_time = max(enemy.exploration_cadence, 0.05)
+	if mode == GameMode.EXPLORATION and timer.is_stopped():
+		timer.start()
+
+
+func _remove_enemy_exploration_timer(enemy: Enemy) -> void:
+	if not exploration_enemy_timers.has(enemy):
+		return
+	var timer := exploration_enemy_timers[enemy] as Timer
+	exploration_enemy_timers.erase(enemy)
+	if timer != null and is_instance_valid(timer):
+		timer.stop()
+		timer.queue_free()
+
+
+func _on_enemy_exploration_timer_timeout(enemy: Enemy) -> void:
+	if mode != GameMode.EXPLORATION or exploration_pending_combat:
+		return
+	if enemy == null or not is_instance_valid(enemy):
+		return
+	if enemy.exploration_action_in_progress or enemy.state != Enemy.State.ALIVE:
+		return
+	await _resolve_enemy_exploration_action(enemy)
+
+
+func _resolve_enemy_exploration_action(enemy: Enemy) -> void:
+	if mode != GameMode.EXPLORATION or exploration_pending_combat:
+		return
+	if enemy == null or not is_instance_valid(enemy):
+		return
+	if enemy.exploration_action_in_progress:
+		return
+
+	var action := _build_enemy_exploration_action(enemy)
+	if action.is_empty():
+		return
+
+	enemy.exploration_action_in_progress = true
+	match String(action.get("kind", "")):
+		"move":
+			await _move_enemy_exploration_one_tile(enemy, Vector2i(action["to"]))
+			if enemy != null and is_instance_valid(enemy) and enemy.grid_position == action["target"]:
+				enemy.advance_patrol_index()
+		"rotate":
+			await _rotate_enemy_in_place(enemy, Vector2i(action["facing"]))
+	if enemy == null or not is_instance_valid(enemy):
+		return
+	enemy.exploration_action_in_progress = false
+	_update_enemy_intent(enemy)
+
+
+func _build_enemy_exploration_action(enemy: Enemy) -> Dictionary:
+	var move_action := _build_enemy_patrol_action(enemy)
+	if not move_action.is_empty():
+		return move_action
+
+	var rotate_action := _build_enemy_rotation_action(enemy)
+	if not rotate_action.is_empty():
+		return rotate_action
+
+	return {}
+
+
+func _build_enemy_patrol_action(enemy: Enemy) -> Dictionary:
+	var action: Dictionary = {}
+	if enemy == null or not is_instance_valid(enemy):
+		return action
+	if not enemy.can_patrol():
+		return action
+
+	var target := enemy.get_current_patrol_target()
+	if enemy.grid_position == target:
+		enemy.advance_patrol_index()
+		target = enemy.get_current_patrol_target()
+	if enemy.grid_position == target:
+		return action
+
+	var path := _find_bfs_path(enemy.grid_position, target, enemy, true, true)
+	if path.is_empty():
+		return action
+
+	var next_tile: Vector2i = path[0]
+	if not _can_move_to_tile(next_tile, enemy):
+		return action
+
+	action["kind"] = "move"
+	action["to"] = next_tile
+	action["target"] = target
+	return action
+
+
+func _build_enemy_rotation_action(enemy: Enemy) -> Dictionary:
+	var action: Dictionary = {}
+	if enemy == null or not is_instance_valid(enemy):
+		return action
+	if not enemy.can_rotate_in_place():
+		return action
+
+	enemy.advance_look_direction()
+	var next_facing := enemy.get_current_look_direction()
+	if next_facing == enemy.facing_dir:
+		return action
+
+	action["kind"] = "rotate"
+	action["facing"] = next_facing
+	return action
+
+
+func _move_enemy_exploration_one_tile(enemy: Enemy, next_tile: Vector2i) -> bool:
+	if enemy == null or not is_instance_valid(enemy):
+		return false
+	if not _can_move_to_tile(next_tile, enemy):
+		return false
+
+	var start_tile := enemy.grid_position
+	var delta := next_tile - start_tile
+	if delta != Vector2i.ZERO:
+		enemy.facing_dir = delta
+
+	if debug_enemy_step_logging:
+		var step_hazard := String(get_hazard_at(next_tile).get("type", ""))
+		if step_hazard.is_empty():
+			print("Enemy exploration step ", enemy.name, ": ", start_tile, " -> ", next_tile)
+		else:
+			print("Enemy exploration step ", enemy.name, ": ", start_tile, " -> ", next_tile, " through ", step_hazard)
+
+	var target_position := _grid_to_world_center(next_tile)
+	_reserve_exploration_motion(enemy, start_tile, next_tile)
+	enemy.set_grid_position(next_tile, false)
+	exploration_active_presentations += 1
+	_refresh_exploration_state()
+
+	if enemy_step_duration > 0.0:
+		var tween := create_tween()
+		tween.tween_property(enemy, "position", target_position, enemy_step_duration)
+		await tween.finished
+
+	exploration_active_presentations = max(exploration_active_presentations - 1, 0)
+	_clear_exploration_reservations_for(enemy)
+	if enemy == null or not is_instance_valid(enemy):
+		_refresh_exploration_state()
+		return false
+
+	enemy.position = target_position
+	_resolve_entity_tile_entry(enemy)
+	_rebuild_enemy_threat_map()
+	_resolve_exploration_detection("enemy_move", enemy)
+	_flush_pending_exploration_transition_if_ready()
+	_refresh_exploration_state()
+	var resolved_message := _consume_environment_messages("")
+	if not resolved_message.is_empty():
+		message = resolved_message
+	_update_message()
+	_refresh_ui()
+	queue_redraw()
+	return true
+
+
+func _rotate_enemy_in_place(enemy: Enemy, facing: Vector2i) -> bool:
+	if enemy == null or not is_instance_valid(enemy):
+		return false
+	if facing == enemy.facing_dir:
+		return false
+
+	exploration_active_presentations += 1
+	_refresh_exploration_state()
+
+	if enemy_rotation_duration > 0.0:
+		var timer := get_tree().create_timer(enemy_rotation_duration)
+		await timer.timeout
+
+	exploration_active_presentations = max(exploration_active_presentations - 1, 0)
+	if enemy == null or not is_instance_valid(enemy):
+		_refresh_exploration_state()
+		return false
+
+	enemy.facing_dir = facing
+	_rebuild_enemy_threat_map()
+	_resolve_exploration_detection("enemy_rotate", enemy)
+	_flush_pending_exploration_transition_if_ready()
+	_refresh_exploration_state()
+	_refresh_ui()
+	queue_redraw()
+	return true
+
+
+func _reserve_exploration_motion(actor, from_tile: Vector2i, to_tile: Vector2i) -> void:
+	_clear_exploration_reservations_for(actor)
+	exploration_reserved_tiles[from_tile] = actor
+	exploration_reserved_tiles[to_tile] = actor
+
+
+func _clear_exploration_reservations_for(actor) -> void:
+	var reserved_tiles: Array[Vector2i] = []
+	for tile in exploration_reserved_tiles.keys():
+		if exploration_reserved_tiles[tile] == actor:
+			reserved_tiles.append(tile)
+	for tile in reserved_tiles:
+		exploration_reserved_tiles.erase(tile)
+
+
+func _is_tile_reserved_by_other(tile: Vector2i, actor = null) -> bool:
+	if not exploration_reserved_tiles.has(tile):
+		return false
+	return exploration_reserved_tiles[tile] != actor
+
+
+func _resolve_exploration_detection(trigger_kind: String, preferred_enemy: Enemy = null) -> bool:
+	if mode != GameMode.EXPLORATION or exploration_pending_combat:
+		return false
+
+	var triggering_enemy: Enemy = null
+	if preferred_enemy != null and is_instance_valid(preferred_enemy) and _enemy_detects_player(preferred_enemy):
+		triggering_enemy = preferred_enemy
+	else:
+		for enemy in enemies:
+			if enemy == null or not is_instance_valid(enemy):
+				continue
+			if _enemy_detects_player(enemy):
+				triggering_enemy = enemy
+				break
+
+	if triggering_enemy == null:
+		return false
+
+	_queue_exploration_combat_transition(triggering_enemy, "enemy_detection:%s" % trigger_kind)
+	return true
+
+
+func _try_player_initiated_exploration_combat(target_enemy: Enemy, reason: String) -> bool:
+	if mode != GameMode.EXPLORATION:
+		return false
+	if target_enemy == null or not is_instance_valid(target_enemy):
+		return false
+	if target_enemy.state != Enemy.State.ALIVE:
+		return false
+
+	_queue_exploration_combat_transition(target_enemy, reason)
+	_flush_pending_exploration_transition_if_ready()
+	return true
+
+
+func _queue_exploration_combat_transition(trigger_enemy: Enemy, trigger_reason: String) -> void:
+	if exploration_pending_combat:
+		return
+	exploration_pending_combat = true
+	exploration_combat_trigger_enemy = trigger_enemy
+	exploration_combat_trigger_reason = trigger_reason
+	_refresh_exploration_state()
+
+
+func _flush_pending_exploration_transition_if_ready() -> void:
+	if not exploration_pending_combat:
+		return
+	if mode != GameMode.EXPLORATION:
+		return
+	if exploration_active_presentations > 0 or player_move_in_progress:
+		return
+
+	_start_combat(exploration_combat_trigger_enemy, exploration_combat_trigger_reason)
+
+
+func _enemy_detects_player(enemy: Enemy) -> bool:
+	if enemy == null or not is_instance_valid(enemy):
+		return false
+	return player.grid_position in _get_enemy_detection_tiles(enemy)
+
+
+func _is_detection_tile_visible(
+	origin: Vector2i,
+	forward: Vector2i,
+	right: Vector2i,
+	target_tile: Vector2i
+) -> bool:
+	if not _is_in_bounds(target_tile):
+		return false
+
+	var delta := target_tile - origin
+	var forward_distance := delta.x * forward.x + delta.y * forward.y
+	if forward_distance <= 0:
+		return false
+
+	var side_distance := delta.x * right.x + delta.y * right.y
+	var side_sign := int(sign(side_distance))
+	var side_steps : int = abs(side_distance)
+
+	for step_forward in range(1, forward_distance + 1):
+		var center_tile := origin + forward * step_forward
+		if terrain_blocks_vision(center_tile):
+			return false
+
+		if side_steps <= 0:
+			continue
+
+		var side_lane_tile := center_tile + right * side_sign * side_steps
+		if terrain_blocks_vision(side_lane_tile):
+			return false
+
+	return true
+
+
+func _get_enemy_detection_tiles(enemy: Enemy) -> Array[Vector2i]:
+	var tiles: Array[Vector2i] = []
+	if enemy == null or not is_instance_valid(enemy):
+		return tiles
+
+	var forward := enemy.facing_dir.sign()
+	if abs(forward.x) + abs(forward.y) != 1:
+		forward = Vector2i.LEFT
+	var right := Vector2i(-forward.y, forward.x)
+
+	for distance in range(1, enemy.exploration_detection_range + 1):
+		var center := enemy.grid_position + forward * distance
+		if not _is_detection_tile_visible(enemy.grid_position, forward, right, center):
+			break
+
+		tiles.append(center)
+
+		var side_reach :int = min(enemy.exploration_side_vision, max(distance - 1, 0))
+		for side_index in range(1, side_reach + 1):
+			var left_tile := center - right * side_index
+			if _is_detection_tile_visible(enemy.grid_position, forward, right, left_tile):
+				tiles.append(left_tile)
+
+			var right_tile := center + right * side_index
+			if _is_detection_tile_visible(enemy.grid_position, forward, right, right_tile):
+				tiles.append(right_tile)
+
+	return tiles

@@ -12,8 +12,10 @@ var block := 0
 var hiding := false
 
 
-func set_grid_position(value: Vector2i) -> void:
+func set_grid_position(value: Vector2i, sync_visual: bool = true) -> void:
 	grid_position = value
+	if not sync_visual:
+		return
 	position = Vector2(grid_position * TILE_SIZE) + Vector2(TILE_SIZE / 2, TILE_SIZE / 2)
 
 
