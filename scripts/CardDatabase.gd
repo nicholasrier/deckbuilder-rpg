@@ -4,9 +4,10 @@ const STARTER_DECK := [
 	"strike", "strike", "strike", "strike",
 	"block", "block", "block", "block",
 	"lunge", "lunge",
-	"backstab", "backstab",
+	"backstab", 
 	"slip_past", "slip_past",
-	"unseen", "unseen"
+	"unseen", "unseen",
+	"dash", "dash", "dash"
 ]
 
 const CARDS := {

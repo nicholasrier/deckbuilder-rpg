@@ -28,6 +28,15 @@ const HAZARD_DEFS := {
 	}
 }
 
+const NEXT_MANUAL_MOVE_MODIFIER_DEFS := {
+	"dash": {
+		"id": "dash",
+		"bonus_distance": 1,
+		"ignore_intermediate_hazards": true,
+		"check_detection_only_on_final_tile": true
+	}
+}
+
 const DeckManagerScript := preload("res://scripts/DeckManager.gd")
 const CardDatabaseScript := preload("res://scripts/CardDatabase.gd")
 const CrateObjectScene := preload("res://scenes/CrateObject.tscn")
@@ -97,6 +106,7 @@ var exploration_combat_trigger_reason: String = ""
 var combat_transition_running: bool = false
 var combat_transition_can_start: bool = false
 var suppress_next_move_input: bool = false
+var next_manual_move_modifiers: Array[Dictionary] = []
 
 
 func mark_threat_tile(tile: Vector2i) -> void:
@@ -113,6 +123,45 @@ func is_tile_threatened(tile: Vector2i) -> bool:
 
 func is_player_in_threat() -> bool:
 	return is_tile_threatened(player.grid_position)
+
+
+func _has_next_manual_move_modifier() -> bool:
+	return not next_manual_move_modifiers.is_empty()
+
+
+func _get_next_manual_move_effect_preview() -> Dictionary:
+	var aggregated: Dictionary = {
+		"armed": false,
+		"bonus_distance": 0,
+		"ignore_intermediate_hazards": false,
+		"check_detection_only_on_final_tile": false
+	}
+
+	for modifier in next_manual_move_modifiers:
+		aggregated["armed"] = true
+		aggregated["bonus_distance"] = int(aggregated["bonus_distance"]) + int(modifier.get("bonus_distance", 0))
+		aggregated["ignore_intermediate_hazards"] = bool(aggregated["ignore_intermediate_hazards"]) or bool(modifier.get("ignore_intermediate_hazards", false))
+		aggregated["check_detection_only_on_final_tile"] = bool(aggregated["check_detection_only_on_final_tile"]) or bool(modifier.get("check_detection_only_on_final_tile", false))
+
+	return aggregated
+
+
+func _consume_next_manual_move_effect() -> Dictionary:
+	var effect := _get_next_manual_move_effect_preview()
+	if _has_next_manual_move_modifier():
+		next_manual_move_modifiers.clear()
+		queue_redraw()
+	return effect
+
+
+func _arm_next_manual_move_modifier(modifier_id: String) -> bool:
+	var modifier_def: Dictionary = NEXT_MANUAL_MOVE_MODIFIER_DEFS.get(modifier_id, {})
+	if modifier_def.is_empty():
+		return false
+
+	next_manual_move_modifiers.append(modifier_def.duplicate(true))
+	queue_redraw()
+	return true
 
 
 func _set_exploration_state(next_state: int) -> void:
@@ -271,6 +320,13 @@ func _draw() -> void:
 				true
 			)
 			_draw_tile_overlay(tile, tile_pos)
+			if tile == player.grid_position and _has_next_manual_move_modifier():
+				draw_rect(
+					Rect2(tile_pos + Vector2.ONE * 3, Vector2.ONE * (TILE_SIZE - 6)),
+					Color(0.886275, 0.729412, 0.262745, 0.95),
+					false,
+					3.0
+				)
 
 	for t in targets:
 		if t == null or not is_instance_valid(t):
@@ -645,13 +701,65 @@ func _read_move_input() -> Vector2i:
 	return Vector2i.ZERO
 
 
+func _resolve_player_manual_move_action(direction: Vector2i) -> Dictionary:
+	var step_direction := direction.sign()
+	var move_effect := _consume_next_manual_move_effect()
+	var attempted_distance := 1 + int(move_effect.get("bonus_distance", 0))
+	# Keep the blocked tile in the result so an impact/bonk presentation can hook in later.
+	var result: Dictionary = {
+		"success": false,
+		"attempted_distance": attempted_distance,
+		"moved_distance": 0,
+		"blocked": false,
+		"blocked_tile": Vector2i.ZERO,
+		"ended_tile": player.grid_position,
+		"used_modifier": bool(move_effect.get("armed", false))
+	}
+
+	if abs(step_direction.x) + abs(step_direction.y) != 1:
+		return result
+
+	for step_index in range(attempted_distance):
+		var next_tile: Vector2i = player.grid_position + step_direction
+		if not _can_move_to_tile(next_tile, player):
+			result["blocked"] = true
+			result["blocked_tile"] = next_tile
+			break
+
+		var should_stop_after_step := step_index == attempted_distance - 1
+		if not should_stop_after_step:
+			var lookahead_tile: Vector2i = next_tile + step_direction
+			should_stop_after_step = not _can_move_to_tile(lookahead_tile, player)
+
+		var move_rules := {
+			"apply_hazards": should_stop_after_step or not bool(move_effect.get("ignore_intermediate_hazards", false)),
+			"apply_tile_triggers": true,
+			"resolve_detection": should_stop_after_step or not bool(move_effect.get("check_detection_only_on_final_tile", false))
+		}
+		if not await _move_player_one_tile(next_tile, move_rules):
+			result["blocked"] = true
+			result["blocked_tile"] = next_tile
+			break
+
+		result["success"] = true
+		result["moved_distance"] = int(result["moved_distance"]) + 1
+		result["ended_tile"] = player.grid_position
+
+		if player.hp <= 0 or mode == GameMode.DEFEAT:
+			break
+		if mode == GameMode.COMBAT_TRANSITION:
+			break
+
+	return result
+
+
 func _try_exploration_move(direction: Vector2i) -> void:
 	if must_resolve_overflow:
 		message = "Hand overflow: play or discard a card first."
 		_update_message()
 		return
-	var target: Vector2i = player.grid_position + direction
-	if not await _move_player_one_tile(target):
+	var move_result := await _resolve_player_manual_move_action(direction)
+	if not bool(move_result.get("success", false)):
 		return
 	if mode != GameMode.EXPLORATION:
 		return
@@ -1350,11 +1458,15 @@ func _move_entity_to_tile(entity: Node2D, target: Vector2i) -> bool:
 	return _move_grid_target_to_tile(entity, target)
 
 
-func _move_player_one_tile(target: Vector2i) -> bool:
+func _move_player_one_tile(target: Vector2i, move_rules: Dictionary = {}) -> bool:
 	if player_move_in_progress:
 		return false
 	if not _can_move_to_tile(target, player):
 		return false
+
+	var apply_hazards: bool = bool(move_rules.get("apply_hazards", true))
+	var apply_tile_triggers: bool = bool(move_rules.get("apply_tile_triggers", true))
+	var resolve_detection: bool = bool(move_rules.get("resolve_detection", true))
 
 	player_move_in_progress = true
 	if debug_player_step_logging:
@@ -1378,7 +1490,7 @@ func _move_player_one_tile(target: Vector2i) -> bool:
 	player.position = target_position
 	exploration_active_presentations = max(exploration_active_presentations - 1, 0)
 	_clear_exploration_reservations_for(player)
-	_resolve_entity_tile_entry(player)
+	_resolve_entity_tile_entry(player, apply_hazards, apply_tile_triggers)
 	if player.hp <= 0:
 		player_move_in_progress = false
 		_refresh_exploration_state()
@@ -1388,7 +1500,8 @@ func _move_player_one_tile(target: Vector2i) -> bool:
 		queue_redraw()
 		return true
 	_rebuild_enemy_threat_map()
-	_resolve_exploration_detection("player_move")
+	if resolve_detection:
+		_resolve_exploration_detection("player_move")
 	player_move_in_progress = false
 	_flush_pending_exploration_transition_if_ready()
 	_refresh_exploration_state()
@@ -1401,8 +1514,8 @@ func _try_combat_move(direction: Vector2i) -> void:
 		_update_message()
 		return
 
-	var target: Vector2i = player.grid_position + direction
-	if not await _move_player_one_tile(target):
+	var move_result := await _resolve_player_manual_move_action(direction)
+	if not bool(move_result.get("success", false)):
 		return
 
 	current_energy -= 1
@@ -1575,6 +1688,8 @@ func _resolve_card(card: Dictionary) -> Dictionary:
 			return _play_strike()
 		"block":
 			return _play_block()
+		"dash":
+			return _play_dash()
 		"lunge":
 			return _play_lunge()
 		"backstab":
@@ -1603,6 +1718,12 @@ func _play_strike() -> Dictionary:
 func _play_block() -> Dictionary:
 	player.gain_block(5)
 	return {"success": true, "message": "Gained 5 block."}
+
+
+func _play_dash() -> Dictionary:
+	if not _arm_next_manual_move_modifier("dash"):
+		return {"success": false, "message": "Dash could not be armed."}
+	return {"success": true, "message": "Your next manual move gains +1 distance."}
 
 
 func _play_lunge() -> Dictionary:
@@ -1897,12 +2018,13 @@ func resolve_draw_pickup(draw_count: int) -> void:
 		pending_environment_messages.append("Hand overflow: play or discard a card.")
 
 
-func _resolve_entity_tile_entry(entity) -> void:
+func _resolve_entity_tile_entry(entity, apply_hazards: bool = true, apply_tile_triggers: bool = true) -> void:
 	if entity == null or not is_instance_valid(entity):
 		return
 
-	_apply_on_enter_tile_effects(entity, entity.grid_position)
-	if entity == player:
+	if apply_hazards:
+		_apply_on_enter_tile_effects(entity, entity.grid_position)
+	if entity == player and apply_tile_triggers:
 		_resolve_tile_triggers(player)
 
 
