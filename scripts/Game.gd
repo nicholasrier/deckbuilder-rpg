@@ -9,6 +9,9 @@ const CARDINAL_DIRECTIONS: Array[Vector2i] = [
 	Vector2i.DOWN,
 	Vector2i.LEFT
 ]
+const DIRECTIONAL_PROJECTILE_TARGETING := "directional_projectile"
+const PROJECTILE_PREVIEW_FILL_COLOR := Color(0.886275, 0.729412, 0.262745, 0.22)
+const PROJECTILE_PREVIEW_BORDER_COLOR := Color(1.0, 0.827451, 0.27451, 0.9)
 
 const TERRAIN_DEFS := {
 	"floor": {
@@ -107,6 +110,10 @@ var combat_transition_running: bool = false
 var combat_transition_can_start: bool = false
 var suppress_next_move_input: bool = false
 var next_manual_move_modifiers: Array[Dictionary] = []
+var pending_directional_card_index: int = -1
+var pending_directional_card: Dictionary = {}
+var directional_projectile_preview: Dictionary = {}
+var resolving_player_card: bool = false
 
 
 func mark_threat_tile(tile: Vector2i) -> void:
@@ -149,9 +156,15 @@ func _get_next_manual_move_effect_preview() -> Dictionary:
 func _consume_next_manual_move_effect() -> Dictionary:
 	var effect := _get_next_manual_move_effect_preview()
 	if _has_next_manual_move_modifier():
-		next_manual_move_modifiers.clear()
-		queue_redraw()
+		_clear_next_manual_move_modifiers()
 	return effect
+
+
+func _clear_next_manual_move_modifiers() -> void:
+	if next_manual_move_modifiers.is_empty():
+		return
+	next_manual_move_modifiers.clear()
+	queue_redraw()
 
 
 func _arm_next_manual_move_modifier(modifier_id: String) -> bool:
@@ -290,7 +303,7 @@ func _setup_environment_layers() -> void:
 	_set_terrain(Vector2i(5, 1), "wall")
 	_set_terrain(Vector2i(6, 2), "wall")
 	_set_terrain(Vector2i(7, 0), "wall")
-	_set_terrain(Vector2i(5, 0), "wall")
+	#_set_terrain(Vector2i(5, 0), "wall")
 
 	_set_hazard(Vector2i(2, 1), "fire")
 	_set_hazard(Vector2i(7, 5), "fire")
@@ -298,9 +311,9 @@ func _setup_environment_layers() -> void:
 	var crate := CrateObjectScene.instantiate()
 	crate = CrateObjectScene.instantiate()
 	add_object(crate, Vector2i(6, 0))
-	#crate = CrateObjectScene.instantiate()
-	#add_object(crate, Vector2i(5, 0))
-	
+	crate = CrateObjectScene.instantiate()
+	add_object(crate, Vector2i(5, 0))
+
 	var draw_pickup := DrawPickupScene.instantiate()
 	add_object(draw_pickup, Vector2i(2, 3))
 
@@ -320,6 +333,7 @@ func _draw() -> void:
 				true
 			)
 			_draw_tile_overlay(tile, tile_pos)
+			_draw_directional_projectile_preview_tile(tile, tile_pos)
 			if tile == player.grid_position and _has_next_manual_move_modifier():
 				draw_rect(
 					Rect2(tile_pos + Vector2.ONE * 3, Vector2.ONE * (TILE_SIZE - 6)),
@@ -361,6 +375,23 @@ func _draw_tile_overlay(tile: Vector2i, tile_pos: Vector2) -> void:
 		)
 
 
+func _draw_directional_projectile_preview_tile(tile: Vector2i, tile_pos: Vector2) -> void:
+	if not _is_tile_in_directional_projectile_preview(tile):
+		return
+
+	draw_rect(
+		Rect2(tile_pos + Vector2.ONE * 4, Vector2.ONE * (TILE_SIZE - 8)),
+		PROJECTILE_PREVIEW_FILL_COLOR,
+		true
+	)
+	draw_rect(
+		Rect2(tile_pos + Vector2.ONE * 5, Vector2.ONE * (TILE_SIZE - 10)),
+		PROJECTILE_PREVIEW_BORDER_COLOR,
+		false,
+		2.0
+	)
+
+
 func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> Enemy:
 	var e := scene.instantiate() as Enemy
 	e.set_grid_position(pos)
@@ -392,6 +423,14 @@ func _input(event: InputEvent) -> void:
 	if _is_input_locked():
 		return
 
+	if _has_pending_directional_card() \
+	and event is InputEventMouseButton \
+	and event.button_index == MOUSE_BUTTON_RIGHT \
+	and event.pressed:
+		_cancel_pending_directional_card()
+		get_viewport().set_input_as_handled()
+		return
+
 	if event is InputEventMouseButton \
 	and event.button_index == MOUSE_BUTTON_LEFT \
 	and event.pressed:
@@ -401,6 +440,10 @@ func _input(event: InputEvent) -> void:
 		var world_pos := get_global_mouse_position()
 		var clicked_tile := _world_to_grid(world_pos)
 		if not _is_in_bounds(clicked_tile):
+			return
+
+		if _has_pending_directional_card():
+			_handle_directional_projectile_click(clicked_tile)
 			return
 
 		var clicked_targetable: Node2D = _get_targetable_at_world_pos(world_pos)
@@ -424,6 +467,19 @@ func _unhandled_input(event: InputEvent) -> void:
 		_handle_combat_transition_input(event)
 		return
 	if _is_input_locked():
+		return
+
+	if _has_pending_directional_card():
+		if event.is_action_pressed("ui_cancel"):
+			_cancel_pending_directional_card()
+		elif event.is_action_pressed("end_turn") \
+		or event.is_action_pressed("card_1") \
+		or event.is_action_pressed("card_2") \
+		or event.is_action_pressed("card_3") \
+		or event.is_action_pressed("card_4") \
+		or event.is_action_pressed("card_5"):
+			message = "Choose a cardinal throw direction for %s." % pending_directional_card.get("name", "this card")
+			_update_message()
 		return
 
 	if mode == GameMode.EXPLORATION and event.is_action_pressed("wait"):
@@ -634,6 +690,10 @@ func damage_object_at(tile: Vector2i, amount: int) -> void:
 
 
 func _process(_delta: float) -> void:
+	if _has_pending_directional_card():
+		_update_directional_projectile_preview_from_mouse()
+		return
+
 	if _is_movement_locked():
 		return
 
@@ -1561,6 +1621,7 @@ func _begin_player_turn(draw_card: bool = true) -> void:
 
 
 func _end_player_turn() -> void:
+	_clear_next_manual_move_modifiers()
 	_apply_end_turn_tile_effects(player)
 	if player.hp <= 0:
 		mode = GameMode.DEFEAT
@@ -1641,6 +1702,10 @@ func _enemy_take_turn() -> void:
 func _handle_card_shortcut(index: int) -> void:
 	if _is_input_locked():
 		return
+	if _has_pending_directional_card():
+		message = "Choose a cardinal throw direction for %s." % pending_directional_card.get("name", "this card")
+		_update_message()
+		return
 	if index >= deck_manager.hand.size():
 		return
 	if must_resolve_overflow:
@@ -1665,19 +1730,33 @@ func _play_card(index: int) -> void:
 		message = "Not enough energy for %s." % card["name"]
 		_update_message()
 		return
-		
+
+	if _is_directional_projectile_card(card):
+		_select_directional_projectile_card(index, card)
+		return
+
+	resolving_player_card = true
 	var result := _resolve_card(card)
+	resolving_player_card = false
 	if not result["success"]:
 		message = result["message"]
 		_update_message()
 		return
+	_finish_played_card(index, result)
+
+
+func _finish_played_card(index: int, result: Dictionary) -> void:
+	if index < 0 or index >= deck_manager.hand.size():
+		return
+	var card: Dictionary = deck_manager.hand[index]
 	current_energy -= int(card["cost"])
-	
-	var played := deck_manager.play_from_hand(index)
+
+	var played := deck_manager.play_from_hand(index, bool(card.get("exhaust", false)))
 	message = "Played %s. %s" % [played["name"], result["message"]]
 
 	_update_all_enemy_intent()
-	_check_end_of_combat()
+	if mode == GameMode.COMBAT or mode == GameMode.COMBAT_TRANSITION:
+		_check_end_of_combat()
 	_refresh_ui()
 	queue_redraw()
 
@@ -1700,6 +1779,258 @@ func _resolve_card(card: Dictionary) -> Dictionary:
 			return _play_unseen()
 		_:
 			return {"success": false, "message": "Card effect not implemented."}
+
+
+func _is_directional_projectile_card(card: Dictionary) -> bool:
+	return String(card.get("targeting", "")) == DIRECTIONAL_PROJECTILE_TARGETING
+
+
+func _has_pending_directional_card() -> bool:
+	return pending_directional_card_index >= 0 and not pending_directional_card.is_empty()
+
+
+func _select_directional_projectile_card(index: int, card: Dictionary) -> void:
+	pending_directional_card_index = index
+	pending_directional_card = card.duplicate(true)
+	directional_projectile_preview.clear()
+	_set_current_target(null)
+	_update_directional_projectile_preview_from_mouse()
+	message = "Choose a same-row or same-column tile to throw %s." % card.get("name", "this card")
+	_refresh_ui()
+	queue_redraw()
+
+
+func _cancel_pending_directional_card() -> void:
+	if not _has_pending_directional_card():
+		return
+	var card_name := String(pending_directional_card.get("name", "card"))
+	_clear_pending_directional_card(false)
+	message = "Canceled %s." % card_name
+	controls_label.text = _controls_text()
+	_update_hand_button_disabled_states()
+	_update_message()
+	queue_redraw()
+
+
+func _clear_pending_directional_card(refresh: bool = true) -> void:
+	pending_directional_card_index = -1
+	pending_directional_card.clear()
+	directional_projectile_preview.clear()
+	if refresh:
+		_refresh_ui()
+		queue_redraw()
+
+
+func _update_directional_projectile_preview_from_mouse() -> void:
+	if not _has_pending_directional_card():
+		return
+	if _is_pointer_over_card_ui():
+		directional_projectile_preview.clear()
+		queue_redraw()
+		return
+
+	var hover_tile := _world_to_grid(get_global_mouse_position())
+	if not _is_in_bounds(hover_tile):
+		directional_projectile_preview.clear()
+		queue_redraw()
+		return
+
+	directional_projectile_preview = _trace_directional_projectile_choice(player.grid_position, hover_tile, pending_directional_card)
+	queue_redraw()
+
+
+func _handle_directional_projectile_click(clicked_tile: Vector2i) -> void:
+	if not _has_pending_directional_card():
+		return
+
+	var hand_index := pending_directional_card_index
+	if hand_index < 0 or hand_index >= deck_manager.hand.size():
+		_clear_pending_directional_card(false)
+		message = "That card is no longer available."
+		_refresh_ui()
+		queue_redraw()
+		return
+
+	var card: Dictionary = deck_manager.hand[hand_index]
+	if String(card.get("id", "")) != String(pending_directional_card.get("id", "")):
+		_clear_pending_directional_card(false)
+		message = "That card is no longer available."
+		_refresh_ui()
+		queue_redraw()
+		return
+
+	if current_energy < int(card.get("cost", 0)):
+		message = "Not enough energy for %s." % card.get("name", "this card")
+		_update_message()
+		return
+
+	var trace := _trace_directional_projectile_choice(player.grid_position, clicked_tile, card)
+	directional_projectile_preview = trace
+	if not bool(trace.get("valid_direction", false)):
+		message = "%s needs a same-row or same-column tile." % card.get("name", "This card")
+		_update_message()
+		queue_redraw()
+		return
+
+	resolving_player_card = true
+	var result := _resolve_directional_projectile_card(card, trace)
+	resolving_player_card = false
+	if not bool(result.get("success", false)):
+		message = String(result.get("message", "Nothing happened."))
+		_update_message()
+		queue_redraw()
+		return
+
+	_clear_pending_directional_card(false)
+	_finish_played_card(hand_index, result)
+
+
+func _trace_directional_projectile_choice(origin: Vector2i, chosen_tile: Vector2i, card: Dictionary) -> Dictionary:
+	var direction := _get_cardinal_direction_from_tile(origin, chosen_tile)
+	var max_range := int(card.get("max_range", -1))
+	return _trace_cardinal_projectile_line(origin, direction, max_range)
+
+
+func _get_cardinal_direction_from_tile(origin: Vector2i, chosen_tile: Vector2i) -> Vector2i:
+	if chosen_tile == origin:
+		return Vector2i.ZERO
+	if chosen_tile.x == origin.x:
+		return Vector2i(0, int(sign(chosen_tile.y - origin.y)))
+	if chosen_tile.y == origin.y:
+		return Vector2i(int(sign(chosen_tile.x - origin.x)), 0)
+	return Vector2i.ZERO
+
+
+func _trace_cardinal_projectile_line(origin: Vector2i, direction: Vector2i, max_range: int = -1) -> Dictionary:
+	var step_direction := direction.sign()
+	var result: Dictionary = {
+		"valid_direction": false,
+		"direction": step_direction,
+		"preview_tiles": [],
+		"target": null,
+		"target_tile": Vector2i.ZERO,
+		"blocked": false,
+		"blocked_tile": Vector2i.ZERO,
+		"final_reachable_tile": origin
+	}
+
+	if abs(step_direction.x) + abs(step_direction.y) != 1:
+		return result
+
+	result["valid_direction"] = true
+	var preview_tiles: Array[Vector2i] = []
+	var distance := 1
+	while max_range <= 0 or distance <= max_range:
+		var tile := origin + step_direction * distance
+		if not _is_in_bounds(tile):
+			break
+
+		var target := _get_projectile_target_at(tile)
+		if target != null:
+			preview_tiles.append(tile)
+			result["target"] = target
+			result["target_tile"] = tile
+			result["final_reachable_tile"] = tile
+			break
+
+		if _projectile_tile_blocks_line(tile):
+			result["blocked"] = true
+			result["blocked_tile"] = tile
+			break
+
+		preview_tiles.append(tile)
+		result["final_reachable_tile"] = tile
+		distance += 1
+
+	result["preview_tiles"] = preview_tiles
+	return result
+
+
+func _get_projectile_target_at(tile: Vector2i) -> Node2D:
+	var enemy := get_enemy_at(tile)
+	if _is_projectile_valid_target(enemy):
+		return enemy
+
+	var obj := get_object_at(tile) as Node2D
+	if _is_projectile_valid_target(obj):
+		return obj
+
+	return null
+
+
+func _is_projectile_valid_target(target: Node2D) -> bool:
+	if target == null or not is_instance_valid(target):
+		return false
+	if target is Enemy:
+		return target.state == Enemy.State.ALIVE
+	if target is EnvironmentObject:
+		if not target.is_targetable:
+			return false
+		if target.is_destructible:
+			return target.hp > 0
+		return true
+	return false
+
+
+func _projectile_tile_blocks_line(tile: Vector2i) -> bool:
+	if terrain_blocks_movement(tile):
+		return true
+
+	var obj = get_object_at(tile)
+	return obj != null and bool(obj.blocks_movement)
+
+
+func _resolve_directional_projectile_card(card: Dictionary, trace: Dictionary) -> Dictionary:
+	if not bool(trace.get("valid_direction", false)):
+		return {"success": false, "message": "Choose a cardinal direction."}
+
+	var target := trace.get("target", null) as Node2D
+	if target == null or not is_instance_valid(target):
+		if bool(card.get("breaks_stealth", false)):
+			_break_player_stealth()
+		if bool(trace.get("blocked", false)):
+			return {"success": true, "message": "The dagger stopped short against a blocker."}
+		return {"success": true, "message": "The dagger flew to the edge of the board."}
+
+	var base_damage := int(card.get("damage", 0))
+	var damage := _modify_attack_damage(base_damage) if bool(card.get("breaks_stealth", false)) else base_damage
+	_apply_projectile_hit(target, damage)
+
+	var target_enemy := target as Enemy
+	if mode == GameMode.EXPLORATION and target_enemy != null and is_instance_valid(target_enemy):
+		_try_player_initiated_exploration_combat(target_enemy, "player_throwing_dagger")
+
+	return {
+		"success": true,
+		"message": "Dagger hit %s for %d damage." % [_projectile_target_display_name(target), damage]
+	}
+
+
+func _apply_projectile_hit(target: Node2D, damage: int) -> void:
+	if target == null or not is_instance_valid(target):
+		return
+	# Future switches or interactables can implement this without changing line tracing.
+	if target.has_method("on_projectile_hit"):
+		target.on_projectile_hit(player, self, damage)
+		return
+	if target.has_method("take_damage"):
+		_damage_entity(target, damage)
+
+
+func _projectile_target_display_name(target: Node2D) -> String:
+	if target is Enemy:
+		return "enemy"
+	if target is EnvironmentObject:
+		return _object_display_name(target).to_lower()
+	return "target"
+
+
+func _is_tile_in_directional_projectile_preview(tile: Vector2i) -> bool:
+	var preview_tiles: Array = directional_projectile_preview.get("preview_tiles", [])
+	for preview_tile in preview_tiles:
+		if preview_tile == tile:
+			return true
+	return false
 
 
 func _play_strike() -> Dictionary:
@@ -1754,6 +2085,8 @@ func _play_backstab() -> Dictionary:
 		return {"success": false, "message": "No target selected."}
 	if not _is_adjacent(player.grid_position, current_target.grid_position):
 		return {"success": false, "message": "Backstab needs an adjacent enemy."}
+
+	# need to check if target is an enemy before checking facing direction
 	var behind_tile: Vector2i = current_target.grid_position - current_target.facing_dir
 	var base_damage := 9 if player.grid_position == behind_tile else 5
 	var backstab_damage := _modify_attack_damage(base_damage)
@@ -1792,14 +2125,23 @@ func _has_valid_target() -> bool:
 
 func _modify_attack_damage(base_damage: int) -> int:
 	if player.hiding:
-		player.become_hidden_or_revealed()
+		_break_player_stealth()
 		return int(ceil(base_damage * 1.5))
 	return base_damage
+
+
+func _break_player_stealth() -> void:
+	if player.hiding:
+		player.become_hidden_or_revealed()
 
 
 func _check_end_of_combat() -> void:
 	if not enemies.is_empty():
 		return
+	if resolving_player_card:
+		return
+	var recovered_exhausted_count := deck_manager.recover_exhausted_cards()
+	_clear_pending_directional_card(false)
 	mode = GameMode.EXPLORATION
 	exploration_pending_combat = false
 	exploration_combat_trigger_enemy = null
@@ -1813,6 +2155,9 @@ func _check_end_of_combat() -> void:
 	_rebuild_enemy_threat_map()
 	_refresh_exploration_state()
 	message = _consume_environment_messages("")
+	if recovered_exhausted_count > 0:
+		var recovered_text := "Recovered %d exhausted card(s)." % recovered_exhausted_count
+		message = recovered_text if message.is_empty() else "%s %s" % [message, recovered_text]
 	_update_message()
 
 
@@ -1890,9 +2235,23 @@ func _rebuild_hand() -> void:
 		button.custom_minimum_size = Vector2(150, 96)
 		button.text = "%d. %s\nCost %d\n%s" % [i + 1, card["name"], card["cost"], card["text"]]
 		button.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		button.disabled = mode == GameMode.DEFEAT or mode == GameMode.VICTORY or _is_input_locked()
+		button.disabled = _should_disable_hand_buttons()
 		button.pressed.connect(func() -> void: _handle_card_shortcut(card_index))
 		hand_box.add_child(button)
+
+
+func _should_disable_hand_buttons() -> bool:
+	return mode == GameMode.DEFEAT \
+		or mode == GameMode.VICTORY \
+		or _is_input_locked() \
+		or _has_pending_directional_card()
+
+
+func _update_hand_button_disabled_states() -> void:
+	var disabled := _should_disable_hand_buttons()
+	for child in hand_box.get_children():
+		if child is Button:
+			child.disabled = disabled
 
 
 func _update_message() -> void:
@@ -1915,6 +2274,9 @@ func _combat_transition_message() -> String:
 
 
 func _controls_text() -> String:
+	if _has_pending_directional_card():
+		return "Choose a same-row or same-column tile. Esc cancels."
+
 	match mode:
 		GameMode.EXPLORATION:
 			match exploration_state:
@@ -2474,6 +2836,7 @@ func _try_player_initiated_exploration_combat(target_enemy: Enemy, reason: Strin
 func _queue_exploration_combat_transition(trigger_enemy: Enemy, trigger_reason: String) -> void:
 	if exploration_pending_combat:
 		return
+	_clear_pending_directional_card(false)
 	exploration_pending_combat = true
 	exploration_combat_trigger_enemy = trigger_enemy
 	exploration_combat_trigger_reason = trigger_reason

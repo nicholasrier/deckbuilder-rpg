@@ -13,6 +13,7 @@ var object_type: String = "object"
 var is_destructible: bool = false
 var is_targetable: bool = false
 var is_movable: bool = false
+var facing_dir = Vector2i(0,0)
 
 
 func set_grid_position(value: Vector2i) -> void:

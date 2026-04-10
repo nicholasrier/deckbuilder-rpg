@@ -10,3 +10,4 @@ func _ready() -> void:
 	is_destructible = true
 	is_targetable = true
 	is_movable = true
+	

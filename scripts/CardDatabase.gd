@@ -3,9 +3,10 @@ extends RefCounted
 const STARTER_DECK := [
 	"strike", "strike", "strike", "strike",
 	"block", "block", "block", "block",
-	"lunge", "lunge",
-	"backstab", 
-	"slip_past", "slip_past",
+	"lunge",
+	"throwing_dagger", "throwing_dagger",
+	"backstab", "backstab", "backstab", "backstab",
+	"slip_past",
 	"unseen", "unseen",
 	"dash", "dash", "dash"
 ]
@@ -32,6 +33,18 @@ const CARDS := {
 		"text": "Move 1 tile toward the enemy, then deal 6 damage if adjacent.",
 		"combat_only": false
 	},
+	"throwing_dagger": {
+		"id": "throwing_dagger",
+		"name": "Throwing Dagger",
+		"cost": 1,
+		"text": "Throw in a straight cardinal line. Deal 4 damage. Exhaust.",
+		"combat_only": false,
+		"targeting": "directional_projectile",
+		"damage": 4,
+		"max_range": -1,
+		"breaks_stealth": true,
+		"exhaust": true
+	},
 	"backstab": {
 		"id": "backstab",
 		"name": "Backstab",
@@ -57,7 +70,7 @@ const CARDS := {
 		"id": "dash",
 		"name": "dash",
 		"cost": 0,
-		"text": "Move quickly, unscathed. Add one tile to your next movement.",
+		"text": "Move quickly. Add one tile to your next movement this turn.",
 		"combat_only": false
 	}
 }

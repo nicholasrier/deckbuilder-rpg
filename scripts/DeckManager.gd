@@ -3,12 +3,14 @@ extends RefCounted
 var draw_pile: Array[Dictionary] = []
 var hand: Array[Dictionary] = []
 var discard_pile: Array[Dictionary] = []
+var exhaust_pile: Array[Dictionary] = []
 
 
 func setup(cards: Array[Dictionary]) -> void:
 	draw_pile = cards.duplicate(true)
 	hand.clear()
 	discard_pile.clear()
+	exhaust_pile.clear()
 	shuffle_draw_pile()
 
 
@@ -40,10 +42,22 @@ func discard_from_hand(index: int) -> Dictionary:
 	return card
 
 
-func play_from_hand(index: int) -> Dictionary:
+func play_from_hand(index: int, exhaust: bool = false) -> Dictionary:
 	if index < 0 or index >= hand.size():
 		return {}
 	var card := hand[index]
 	hand.remove_at(index)
-	discard_pile.append(card)
+	if exhaust:
+		exhaust_pile.append(card)
+	else:
+		discard_pile.append(card)
 	return card
+
+
+func recover_exhausted_cards() -> int:
+	var recovered_count := exhaust_pile.size()
+	if recovered_count <= 0:
+		return 0
+	discard_pile.append_array(exhaust_pile)
+	exhaust_pile.clear()
+	return recovered_count
