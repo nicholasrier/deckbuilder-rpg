@@ -3,12 +3,10 @@ extends RefCounted
 const STARTER_DECK := [
 	"strike", "strike", "strike", "strike",
 	"block", "block", "block", "block",
-	"lunge",
-	"throwing_dagger", "throwing_dagger",
-	"backstab", "backstab", "backstab", "backstab",
-	"slip_past",
+	"lunge", "lunge",
+	"backstab", "backstab",
+	"slip_past", "slip_past",
 	"unseen", "unseen",
-	"dash", "dash", "dash"
 ]
 
 const CARDS := {
@@ -68,7 +66,7 @@ const CARDS := {
 	},
 	"dash": {
 		"id": "dash",
-		"name": "dash",
+		"name": "Dash",
 		"cost": 0,
 		"text": "Move quickly. Add one tile to your next movement this turn.",
 		"combat_only": false

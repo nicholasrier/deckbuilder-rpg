@@ -3,6 +3,7 @@ extends Node2D
 const TILE_SIZE := 48
 const GRID_SIZE := Vector2i(10, 7)
 const PLAYER_SPEED := 3
+const HAND_LIMIT := 5
 const CARDINAL_DIRECTIONS: Array[Vector2i] = [
 	Vector2i.UP,
 	Vector2i.RIGHT,
@@ -44,6 +45,8 @@ const DeckManagerScript := preload("res://scripts/DeckManager.gd")
 const CardDatabaseScript := preload("res://scripts/CardDatabase.gd")
 const CrateObjectScene := preload("res://scenes/CrateObject.tscn")
 const DrawPickupScene := preload("res://scenes/DrawPickup.tscn")
+const RewardPickupScene := preload("res://scenes/RewardPickup.tscn")
+const RewardChoiceUIScene := preload("res://scenes/RewardChoiceUI.tscn")
 const ENEMY_COMBAT_PLAN_HOLD: StringName = &"hold"
 const ENEMY_COMBAT_PLAN_PLAYER: StringName = &"player"
 const ENEMY_COMBAT_PLAN_DESTRUCTIBLE_OBJECT: StringName = &"destructible_object"
@@ -52,6 +55,7 @@ enum GameMode {
 	EXPLORATION,
 	COMBAT_TRANSITION,
 	COMBAT,
+	REWARD_CHOICE,
 	VICTORY,
 	DEFEAT
 }
@@ -114,6 +118,9 @@ var pending_directional_card_index: int = -1
 var pending_directional_card: Dictionary = {}
 var directional_projectile_preview: Dictionary = {}
 var resolving_player_card: bool = false
+var active_reward_pickup: RewardPickup = null
+var active_reward_options: Array[Dictionary] = []
+var reward_choice_ui: RewardChoiceUI = null
 
 
 func mark_threat_tile(tile: Vector2i) -> void:
@@ -258,6 +265,7 @@ func _on_environment_object_destroyed(obj) -> void:
 
 func _ready() -> void:
 	_setup_input_map()
+	_setup_reward_choice_ui()
 	_setup_environment_layers()
 	var patrol_enemy := _spawn_enemy(EnemyScene, Vector2i(6, 3))
 	patrol_enemy.exploration_cadence = 0.85
@@ -286,6 +294,12 @@ func _ready() -> void:
 	_update_message()
 	_refresh_ui()
 	queue_redraw()
+
+
+func _setup_reward_choice_ui() -> void:
+	reward_choice_ui = RewardChoiceUIScene.instantiate() as RewardChoiceUI
+	reward_choice_ui.reward_confirmed.connect(_on_reward_confirmed)
+	$CanvasLayer.add_child(reward_choice_ui)
 
 
 func _setup_environment_layers() -> void:
@@ -405,7 +419,7 @@ func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> Enemy:
 
 
 func _is_input_locked() -> bool:
-	if mode == GameMode.COMBAT_TRANSITION:
+	if mode == GameMode.COMBAT_TRANSITION or mode == GameMode.REWARD_CHOICE:
 		return true
 	if mode == GameMode.EXPLORATION:
 		return exploration_pending_combat or player_move_in_progress
@@ -604,6 +618,8 @@ func add_object(obj, tile: Vector2i) -> void:
 
 	if obj.has_signal("destroyed") and not obj.destroyed.is_connected(_on_environment_object_destroyed):
 		obj.destroyed.connect(_on_environment_object_destroyed)
+	if obj.has_signal("reward_requested") and not obj.reward_requested.is_connected(_on_reward_pickup_requested):
+		obj.reward_requested.connect(_on_reward_pickup_requested)
 
 	if obj.get_parent() != self:
 		add_child(obj)
@@ -627,6 +643,153 @@ func consume_map_pickup(pickup) -> void:
 	pickup.hide()
 	pickup.queue_free()
 	queue_redraw()
+
+
+func _make_post_combat_card_reward_options() -> Array[Dictionary]:
+	return [
+		CardDatabaseScript.make_card("dash"),
+		CardDatabaseScript.make_card("throwing_dagger")
+	]
+
+
+func _spawn_post_combat_reward_pickup() -> String:
+	var reward_options := _make_post_combat_card_reward_options()
+	if reward_options.is_empty():
+		return "No reward options were available."
+
+	var spawn_tile := _find_reward_pickup_spawn_tile(player.grid_position)
+	if not _is_in_bounds(spawn_tile):
+		return "No free tile was available for a reward pickup."
+
+	var reward_pickup := RewardPickupScene.instantiate() as RewardPickup
+	reward_pickup.configure(reward_options)
+	add_object(reward_pickup, spawn_tile)
+
+	if _is_adjacent(player.grid_position, spawn_tile):
+		return "A card reward appeared nearby."
+	return "A card reward appeared at the nearest free tile."
+
+
+func _find_reward_pickup_spawn_tile(origin: Vector2i) -> Vector2i:
+	for direction in CARDINAL_DIRECTIONS:
+		var candidate := origin + direction
+		if _is_valid_reward_pickup_spawn_tile(candidate):
+			return candidate
+
+	return _find_nearest_reward_pickup_spawn_tile(origin)
+
+
+func _find_nearest_reward_pickup_spawn_tile(origin: Vector2i) -> Vector2i:
+	var max_radius := GRID_SIZE.x + GRID_SIZE.y
+	for radius in range(2, max_radius + 1):
+		for x in range(GRID_SIZE.x):
+			for y in range(GRID_SIZE.y):
+				var candidate := Vector2i(x, y)
+				if abs(candidate.x - origin.x) + abs(candidate.y - origin.y) != radius:
+					continue
+				if _is_valid_reward_pickup_spawn_tile(candidate):
+					return candidate
+	return Vector2i(-1, -1)
+
+
+func _is_valid_reward_pickup_spawn_tile(tile: Vector2i) -> bool:
+	if get_object_at(tile) != null:
+		return false
+	if not get_hazard_at(tile).is_empty():
+		return false
+	return _is_tile_walkable(tile, null, true, true)
+
+
+func _on_reward_pickup_requested(pickup: RewardPickup, reward_options: Array) -> void:
+	var typed_options: Array[Dictionary] = []
+	for reward in reward_options:
+		if reward is Dictionary:
+			var reward_dict: Dictionary = reward
+			typed_options.append(reward_dict.duplicate(true))
+	_open_reward_choice(typed_options, pickup)
+
+
+func _open_reward_choice(options: Array[Dictionary], source_pickup: RewardPickup = null) -> void:
+	if options.is_empty():
+		return
+	if mode != GameMode.EXPLORATION:
+		return
+
+	active_reward_pickup = source_pickup
+	active_reward_options = options.duplicate(true)
+	_clear_pending_directional_card(false)
+	_pause_exploration_enemy_schedules(true)
+	mode = GameMode.REWARD_CHOICE
+	message = "Choose a reward."
+	if reward_choice_ui != null:
+		reward_choice_ui.open(active_reward_options)
+	_refresh_ui()
+	queue_redraw()
+
+
+func _on_reward_confirmed(reward: Dictionary) -> void:
+	if mode != GameMode.REWARD_CHOICE:
+		return
+
+	var reward_name := String(reward.get("name", "reward"))
+	if not _apply_reward(reward):
+		message = "Could not apply %s." % reward_name
+		_close_reward_choice()
+		_restore_exploration_after_reward()
+		return
+
+	_consume_active_reward_pickup()
+	_close_reward_choice()
+	_restore_exploration_after_reward()
+
+	if must_resolve_overflow:
+		message = "Added %s to your deck and hand. Hand overflow: play or discard a card." % reward_name
+	else:
+		message = "Added %s to your deck and hand." % reward_name
+	_refresh_ui()
+	queue_redraw()
+
+
+func _apply_reward(reward: Dictionary) -> bool:
+	var reward_type := String(reward.get("type", "card"))
+	match reward_type:
+		"card":
+			return _apply_card_reward(reward)
+		_:
+			return false
+
+
+func _apply_card_reward(card: Dictionary) -> bool:
+	if card.is_empty():
+		return false
+	deck_manager.add_card_to_deck(card)
+	deck_manager.add_card_to_hand(card)
+	_refresh_hand_overflow_state()
+	return true
+
+
+func _refresh_hand_overflow_state() -> void:
+	must_resolve_overflow = deck_manager.hand.size() > HAND_LIMIT
+
+
+func _consume_active_reward_pickup() -> void:
+	if active_reward_pickup != null and is_instance_valid(active_reward_pickup):
+		active_reward_pickup.mark_consumed()
+		consume_map_pickup(active_reward_pickup)
+	active_reward_pickup = null
+
+
+func _close_reward_choice() -> void:
+	if reward_choice_ui != null:
+		reward_choice_ui.hide()
+	active_reward_options.clear()
+
+
+func _restore_exploration_after_reward() -> void:
+	mode = GameMode.EXPLORATION
+	_pause_exploration_enemy_schedules(false)
+	_refresh_exploration_state()
+
 
 func _set_current_target(target: Node2D) -> void:
 	current_target = target if target != null and is_instance_valid(target) else null
@@ -807,7 +970,7 @@ func _resolve_player_manual_move_action(direction: Vector2i) -> Dictionary:
 
 		if player.hp <= 0 or mode == GameMode.DEFEAT:
 			break
-		if mode == GameMode.COMBAT_TRANSITION:
+		if mode == GameMode.COMBAT_TRANSITION or mode == GameMode.REWARD_CHOICE:
 			break
 
 	return result
@@ -1551,6 +1714,10 @@ func _move_player_one_tile(target: Vector2i, move_rules: Dictionary = {}) -> boo
 	exploration_active_presentations = max(exploration_active_presentations - 1, 0)
 	_clear_exploration_reservations_for(player)
 	_resolve_entity_tile_entry(player, apply_hazards, apply_tile_triggers)
+	if mode == GameMode.REWARD_CHOICE:
+		player_move_in_progress = false
+		_refresh_exploration_state()
+		return true
 	if player.hp <= 0:
 		player_move_in_progress = false
 		_refresh_exploration_state()
@@ -1710,8 +1877,8 @@ func _handle_card_shortcut(index: int) -> void:
 		return
 	if must_resolve_overflow:
 		var discarded := deck_manager.discard_from_hand(index)
-		message = "Discarded %s to stay at 5 cards." % discarded.get("name", "card")
-		must_resolve_overflow = deck_manager.hand.size() > 5
+		message = "Discarded %s to stay at %d cards." % [discarded.get("name", "card"), HAND_LIMIT]
+		_refresh_hand_overflow_state()
 		_refresh_ui()
 		_update_message()
 		return
@@ -2140,6 +2307,7 @@ func _check_end_of_combat() -> void:
 		return
 	if resolving_player_card:
 		return
+	var was_combat_active := mode == GameMode.COMBAT or mode == GameMode.COMBAT_TRANSITION
 	var recovered_exhausted_count := deck_manager.recover_exhausted_cards()
 	_clear_pending_directional_card(false)
 	mode = GameMode.EXPLORATION
@@ -2158,6 +2326,10 @@ func _check_end_of_combat() -> void:
 	if recovered_exhausted_count > 0:
 		var recovered_text := "Recovered %d exhausted card(s)." % recovered_exhausted_count
 		message = recovered_text if message.is_empty() else "%s %s" % [message, recovered_text]
+	if was_combat_active:
+		var reward_text := _spawn_post_combat_reward_pickup()
+		if not reward_text.is_empty():
+			message = reward_text if message.is_empty() else "%s %s" % [message, reward_text]
 	_update_message()
 
 
@@ -2300,6 +2472,8 @@ func _controls_text() -> String:
 			if must_resolve_overflow:
 				return "Hand overflow: press 1-5 or click a card to discard it. Space is locked."
 			return "Combat: arrow keys/WASD move for 1 energy, 1-5 play cards, Space ends turn."
+		GameMode.REWARD_CHOICE:
+			return "Choose a reward. Click a card, then click it again or press Y. Press N to cancel selection."
 		GameMode.VICTORY:
 			return "Prototype win state reached."
 		GameMode.DEFEAT:
@@ -2315,6 +2489,8 @@ func _mode_name() -> String:
 			return "Combat Transition"
 		GameMode.COMBAT:
 			return "Combat"
+		GameMode.REWARD_CHOICE:
+			return "Reward Choice"
 		GameMode.VICTORY:
 			return "Victory"
 		GameMode.DEFEAT:
@@ -2363,7 +2539,7 @@ func get_tile_tint(tile: Vector2i) -> Color:
 
 func _draw_cards_with_shared_rules(count: int) -> Array[Dictionary]:
 	var drawn := deck_manager.draw_cards(count)
-	must_resolve_overflow = deck_manager.hand.size() > 5
+	_refresh_hand_overflow_state()
 	return drawn
 
 

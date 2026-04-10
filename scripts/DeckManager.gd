@@ -1,5 +1,6 @@
 extends RefCounted
 
+var deck: Array[Dictionary] = []
 var draw_pile: Array[Dictionary] = []
 var hand: Array[Dictionary] = []
 var discard_pile: Array[Dictionary] = []
@@ -7,6 +8,7 @@ var exhaust_pile: Array[Dictionary] = []
 
 
 func setup(cards: Array[Dictionary]) -> void:
+	deck = cards.duplicate(true)
 	draw_pile = cards.duplicate(true)
 	hand.clear()
 	discard_pile.clear()
@@ -31,6 +33,20 @@ func draw_cards(count: int) -> Array[Dictionary]:
 		hand.append(card)
 		drawn.append(card)
 	return drawn
+
+
+func add_card_to_deck(card: Dictionary) -> void:
+	if card.is_empty():
+		return
+	deck.append(card.duplicate(true))
+
+
+func add_card_to_hand(card: Dictionary) -> Dictionary:
+	if card.is_empty():
+		return {}
+	var hand_card := card.duplicate(true)
+	hand.append(hand_card)
+	return hand_card
 
 
 func discard_from_hand(index: int) -> Dictionary:

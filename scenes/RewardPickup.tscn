@@ -1,0 +1,18 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/RewardPickup.gd" id="1_3nps2"]
+
+[node name="RewardPickup" type="Node2D"]
+script = ExtResource("1_3nps2")
+
+[node name="Halo" type="Polygon2D" parent="."]
+color = Color(0.956863, 0.768627, 0.27451, 1)
+polygon = PackedVector2Array(0, -18, 12, -12, 18, 0, 12, 12, 0, 18, -12, 12, -18, 0, -12, -12)
+
+[node name="Core" type="Polygon2D" parent="."]
+color = Color(0.294118, 0.815686, 0.596078, 1)
+polygon = PackedVector2Array(0, -10, 10, 0, 0, 10, -10, 0)
+
+[node name="Spark" type="Polygon2D" parent="."]
+color = Color(1, 0.972549, 0.745098, 1)
+polygon = PackedVector2Array(0, -6, 4, 0, 0, 6, -4, 0)
