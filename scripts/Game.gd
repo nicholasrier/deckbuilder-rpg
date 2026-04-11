@@ -46,13 +46,16 @@ const CardDatabaseScript := preload("res://scripts/CardDatabase.gd")
 const CrateObjectScene := preload("res://scenes/CrateObject.tscn")
 const DrawPickupScene := preload("res://scenes/DrawPickup.tscn")
 const RewardPickupScene := preload("res://scenes/RewardPickup.tscn")
+const ReplayTileScene := preload("res://scenes/ReplayTile.tscn")
 const RewardChoiceUIScene := preload("res://scenes/RewardChoiceUI.tscn")
 const ENEMY_COMBAT_PLAN_HOLD: StringName = &"hold"
 const ENEMY_COMBAT_PLAN_PLAYER: StringName = &"player"
 const ENEMY_COMBAT_PLAN_DESTRUCTIBLE_OBJECT: StringName = &"destructible_object"
+const REPLAY_TILE_GRID_POSITION := Vector2i(9, 3)
 
 enum GameMode {
 	EXPLORATION,
+	POST_COMBAT_REWARD,
 	COMBAT_TRANSITION,
 	COMBAT,
 	REWARD_CHOICE,
@@ -121,6 +124,11 @@ var resolving_player_card: bool = false
 var active_reward_pickup: RewardPickup = null
 var active_reward_options: Array[Dictionary] = []
 var reward_choice_ui: RewardChoiceUI = null
+var reward_choice_return_mode: int = GameMode.EXPLORATION
+var initial_level_snapshot: Dictionary = {}
+var active_replay_tile: ReplayTile = null
+var replay_reset_in_progress := false
+var replay_reset_completed_this_step := false
 
 
 func mark_threat_tile(tile: Vector2i) -> void:
@@ -188,12 +196,16 @@ func _set_exploration_state(next_state: int) -> void:
 	exploration_state = next_state
 
 
+func _is_world_movement_mode() -> bool:
+	return mode == GameMode.EXPLORATION or mode == GameMode.POST_COMBAT_REWARD
+
+
 func _rebuild_enemy_threat_map() -> void:
 	_build_threat_map(enemies)
 
 
 func _refresh_exploration_state() -> void:
-	if mode != GameMode.EXPLORATION:
+	if not _is_world_movement_mode():
 		return
 	if exploration_pending_combat:
 		_set_exploration_state(ExplorationState.TRANSITIONING_TO_COMBAT)
@@ -283,6 +295,7 @@ func _ready() -> void:
 		]
 	)
 	player.set_grid_position(Vector2i(1, 3))
+	capture_initial_level_state()
 	_rebuild_enemy_threat_map()
 	_update_all_enemy_intent()
 	_start_exploration_enemy_schedules()
@@ -330,6 +343,305 @@ func _setup_environment_layers() -> void:
 
 	var draw_pickup := DrawPickupScene.instantiate()
 	add_object(draw_pickup, Vector2i(2, 3))
+
+
+func capture_initial_level_state() -> void:
+	initial_level_snapshot = {
+		"player_start_tile": player.grid_position,
+		"terrain_layer": _duplicate_grid_data_dictionary(terrain_layer),
+		"hazard_layer": _duplicate_grid_data_dictionary(hazard_layer),
+		"enemy_spawns": _capture_enemy_snapshots(),
+		"environment_objects": _capture_environment_object_snapshots()
+	}
+
+
+func reset_level_to_initial_state() -> void:
+	if initial_level_snapshot.is_empty():
+		push_warning("Cannot replay level before an initial level snapshot has been captured.")
+		return
+
+	replay_reset_in_progress = true
+	_close_reward_choice()
+	_remove_active_replay_tile()
+	_clear_pending_directional_card(false)
+	_clear_next_manual_move_modifiers()
+	_clear_combat_runtime_state()
+	_clear_exploration_runtime_state()
+	_clear_current_level_entities()
+	_restore_environment_from_snapshot()
+
+	var player_start_tile: Vector2i = initial_level_snapshot.get("player_start_tile", player.grid_position)
+	player.set_grid_position(player_start_tile)
+	_clear_player_level_local_state()
+
+	mode = GameMode.EXPLORATION
+	_spawn_enemies_from_snapshot()
+	_rebuild_enemy_threat_map()
+	_update_all_enemy_intent()
+	_start_exploration_enemy_schedules()
+	_refresh_hand_overflow_state()
+	_refresh_exploration_state()
+	message = "The room resets. Your deck, hand, piles, and health persist."
+	replay_reset_completed_this_step = true
+	replay_reset_in_progress = false
+	_refresh_ui()
+	queue_redraw()
+
+
+func _duplicate_grid_data_dictionary(source: Dictionary) -> Dictionary:
+	var copy: Dictionary = {}
+	for tile in source.keys():
+		var value: Variant = source[tile]
+		copy[tile] = value.duplicate(true) if value is Dictionary or value is Array else value
+	return copy
+
+
+func _capture_enemy_snapshots() -> Array[Dictionary]:
+	var snapshots: Array[Dictionary] = []
+	for enemy in enemies:
+		if enemy == null or not is_instance_valid(enemy):
+			continue
+		snapshots.append(_capture_enemy_snapshot(enemy))
+	return snapshots
+
+
+func _capture_enemy_snapshot(enemy: Enemy) -> Dictionary:
+	return {
+		"scene_path": _get_scene_path_for_node(enemy, EnemyScene),
+		"tile": enemy.grid_position,
+		"facing_dir": enemy.facing_dir,
+		"hp": enemy.hp,
+		"max_hp": enemy.max_hp,
+		"damage": enemy.damage,
+		"max_energy": enemy.max_energy,
+		"movement_energy_cost": enemy.movement_energy_cost,
+		"attack_energy_cost": enemy.attack_energy_cost,
+		"special_action_energy_cost": enemy.special_action_energy_cost,
+		"movement_per_turn": enemy.movement_per_turn,
+		"exploration_cadence": enemy.exploration_cadence,
+		"exploration_detection_range": enemy.exploration_detection_range,
+		"exploration_side_vision": enemy.exploration_side_vision,
+		"patrol_mode": enemy.patrol_mode,
+		"patrol_points": enemy.patrol_points.duplicate(),
+		"patrol_index": enemy.patrol_index,
+		"patrol_forward": enemy.patrol_forward,
+		"look_directions": enemy.look_directions.duplicate(),
+		"look_direction_index": enemy.look_direction_index
+	}
+
+
+func _capture_environment_object_snapshots() -> Array[Dictionary]:
+	var snapshots: Array[Dictionary] = []
+	for raw_obj in object_layer.values():
+		var obj: EnvironmentObject = raw_obj as EnvironmentObject
+		if obj == null or not is_instance_valid(obj):
+			continue
+		if obj is RewardPickup or obj is ReplayTile:
+			continue
+		snapshots.append(_capture_environment_object_snapshot(obj))
+	return snapshots
+
+
+func _capture_environment_object_snapshot(obj: EnvironmentObject) -> Dictionary:
+	var snapshot := {
+		"scene_path": _get_environment_object_scene_path(obj),
+		"tile": obj.grid_position,
+		"hp": obj.hp,
+		"max_hp": obj.max_hp,
+		"object_type": obj.object_type,
+		"blocks_movement": obj.blocks_movement,
+		"is_destructible": obj.is_destructible,
+		"is_targetable": obj.is_targetable,
+		"is_movable": obj.is_movable,
+		"facing_dir": obj.facing_dir
+	}
+	if obj is MapPickup:
+		var pickup := obj as MapPickup
+		snapshot["consumed"] = pickup.consumed
+	return snapshot
+
+
+func _get_scene_path_for_node(node: Node, fallback_scene: PackedScene = null) -> String:
+	var scene_path := String(node.scene_file_path)
+	if scene_path.is_empty() and fallback_scene != null:
+		scene_path = String(fallback_scene.resource_path)
+	return scene_path
+
+
+func _get_environment_object_scene_path(obj: EnvironmentObject) -> String:
+	var scene_path := _get_scene_path_for_node(obj)
+	if not scene_path.is_empty():
+		return scene_path
+	if obj is CrateObject:
+		return String(CrateObjectScene.resource_path)
+	if obj is DrawPickup:
+		return String(DrawPickupScene.resource_path)
+	if obj is RewardPickup:
+		return String(RewardPickupScene.resource_path)
+	if obj is ReplayTile:
+		return String(ReplayTileScene.resource_path)
+	return ""
+
+
+func _load_packed_scene(scene_path: String, fallback_scene: PackedScene = null) -> PackedScene:
+	if not scene_path.is_empty():
+		var loaded := load(scene_path)
+		if loaded is PackedScene:
+			return loaded as PackedScene
+	return fallback_scene
+
+
+func _clear_combat_runtime_state() -> void:
+	combat_turn = 0
+	current_energy = max_energy
+	movement_left = PLAYER_SPEED
+	enemy_turn_in_progress = false
+	resolving_player_card = false
+	current_target = null
+	threatened_tiles.clear()
+
+
+func _clear_exploration_runtime_state() -> void:
+	player_move_in_progress = false
+	exploration_reserved_tiles.clear()
+	exploration_active_presentations = 0
+	exploration_pending_combat = false
+	exploration_combat_trigger_enemy = null
+	exploration_combat_trigger_reason = ""
+	combat_transition_running = false
+	combat_transition_can_start = false
+	suppress_next_move_input = false
+	pending_environment_messages.clear()
+	_set_exploration_state(ExplorationState.WAITING_FOR_PLAYER_INPUT)
+
+
+func _clear_player_level_local_state() -> void:
+	player.reset_turn_state()
+	if player.hiding:
+		player.become_hidden_or_revealed()
+
+
+func _clear_current_level_entities() -> void:
+	_clear_all_exploration_enemy_timers()
+	for enemy in enemies:
+		if enemy == null or not is_instance_valid(enemy):
+			continue
+		enemy.hide()
+		enemy.queue_free()
+	enemies.clear()
+	targets.clear()
+	current_target = null
+	_clear_all_environment_objects()
+
+
+func _clear_all_exploration_enemy_timers() -> void:
+	for raw_timer in exploration_enemy_timers.values():
+		var timer := raw_timer as Timer
+		if timer == null or not is_instance_valid(timer):
+			continue
+		timer.stop()
+		timer.queue_free()
+	exploration_enemy_timers.clear()
+
+
+func _clear_all_environment_objects() -> void:
+	for raw_obj in object_layer.values():
+		var obj := raw_obj as Node
+		if obj == null or not is_instance_valid(obj):
+			continue
+		obj.hide()
+		obj.queue_free()
+	object_layer.clear()
+	active_reward_pickup = null
+
+
+func _restore_environment_from_snapshot() -> void:
+	terrain_layer = _duplicate_grid_data_dictionary(initial_level_snapshot.get("terrain_layer", {}))
+	hazard_layer = _duplicate_grid_data_dictionary(initial_level_snapshot.get("hazard_layer", {}))
+	_restore_environment_objects_from_snapshot()
+
+
+func _restore_environment_objects_from_snapshot() -> void:
+	var object_snapshots: Array = initial_level_snapshot.get("environment_objects", [])
+	for raw_snapshot in object_snapshots:
+		var snapshot: Dictionary = raw_snapshot
+		var scene := _load_packed_scene(String(snapshot.get("scene_path", "")))
+		if scene == null:
+			push_warning("Skipping environment object replay snapshot with no scene path.")
+			continue
+		var obj := scene.instantiate() as EnvironmentObject
+		if obj == null:
+			push_warning("Skipping environment object replay snapshot that is not an EnvironmentObject.")
+			continue
+		var tile: Vector2i = snapshot.get("tile", Vector2i.ZERO)
+		add_object(obj, tile)
+		_apply_environment_object_snapshot(obj, snapshot)
+
+
+func _apply_environment_object_snapshot(obj: EnvironmentObject, snapshot: Dictionary) -> void:
+	obj.hp = int(snapshot.get("hp", obj.hp))
+	obj.max_hp = int(snapshot.get("max_hp", obj.max_hp))
+	obj.object_type = String(snapshot.get("object_type", obj.object_type))
+	obj.blocks_movement = bool(snapshot.get("blocks_movement", obj.blocks_movement))
+	obj.is_destructible = bool(snapshot.get("is_destructible", obj.is_destructible))
+	obj.is_targetable = bool(snapshot.get("is_targetable", obj.is_targetable))
+	obj.is_movable = bool(snapshot.get("is_movable", obj.is_movable))
+	obj.facing_dir = snapshot.get("facing_dir", obj.facing_dir)
+	if obj is MapPickup:
+		var pickup := obj as MapPickup
+		pickup.consumed = bool(snapshot.get("consumed", false))
+	obj.set_grid_position(snapshot.get("tile", obj.grid_position))
+	if obj.is_targetable and not targets.has(obj):
+		targets.append(obj)
+
+
+func _spawn_enemies_from_snapshot() -> void:
+	var enemy_snapshots: Array = initial_level_snapshot.get("enemy_spawns", [])
+	for raw_snapshot in enemy_snapshots:
+		var snapshot: Dictionary = raw_snapshot
+		var scene := _load_packed_scene(String(snapshot.get("scene_path", "")), EnemyScene)
+		if scene == null:
+			push_warning("Skipping enemy replay snapshot with no scene.")
+			continue
+		var enemy := _spawn_enemy(scene, snapshot.get("tile", Vector2i.ZERO))
+		_apply_enemy_snapshot(enemy, snapshot)
+
+
+func _apply_enemy_snapshot(enemy: Enemy, snapshot: Dictionary) -> void:
+	if enemy == null or not is_instance_valid(enemy):
+		return
+	enemy.max_hp = int(snapshot.get("max_hp", enemy.max_hp))
+	enemy.hp = int(snapshot.get("hp", enemy.max_hp))
+	enemy.damage = int(snapshot.get("damage", enemy.damage))
+	enemy.max_energy = int(snapshot.get("max_energy", enemy.max_energy))
+	enemy.current_energy = enemy.max_energy
+	enemy.movement_energy_cost = int(snapshot.get("movement_energy_cost", enemy.movement_energy_cost))
+	enemy.attack_energy_cost = int(snapshot.get("attack_energy_cost", enemy.attack_energy_cost))
+	enemy.special_action_energy_cost = int(snapshot.get("special_action_energy_cost", enemy.special_action_energy_cost))
+	enemy.movement_per_turn = int(snapshot.get("movement_per_turn", enemy.movement_per_turn))
+	enemy.exploration_cadence = float(snapshot.get("exploration_cadence", enemy.exploration_cadence))
+	enemy.exploration_detection_range = int(snapshot.get("exploration_detection_range", enemy.exploration_detection_range))
+	enemy.exploration_side_vision = int(snapshot.get("exploration_side_vision", enemy.exploration_side_vision))
+	enemy.patrol_mode = int(snapshot.get("patrol_mode", enemy.patrol_mode))
+	enemy.patrol_points = _copy_vector2i_array(snapshot.get("patrol_points", []))
+	enemy.patrol_index = int(snapshot.get("patrol_index", 0))
+	enemy.patrol_forward = bool(snapshot.get("patrol_forward", true))
+	enemy.look_directions = _copy_vector2i_array(snapshot.get("look_directions", []))
+	enemy.look_direction_index = int(snapshot.get("look_direction_index", 0))
+	enemy.facing_dir = snapshot.get("facing_dir", enemy.facing_dir)
+	enemy.state = Enemy.State.ALIVE
+	enemy.awareness_state = Enemy.AwarenessState.IDLE
+	enemy.exploration_action_in_progress = false
+	enemy.set_health_bar_visible(false)
+	enemy.set_grid_position(snapshot.get("tile", enemy.grid_position))
+	_ensure_enemy_exploration_timer(enemy)
+
+
+func _copy_vector2i_array(source: Array) -> Array[Vector2i]:
+	var copy: Array[Vector2i] = []
+	for value in source:
+		copy.append(value)
+	return copy
 
 
 func _draw() -> void:
@@ -419,9 +731,11 @@ func _spawn_enemy(scene: PackedScene, pos: Vector2i) -> Enemy:
 
 
 func _is_input_locked() -> bool:
+	if replay_reset_in_progress:
+		return true
 	if mode == GameMode.COMBAT_TRANSITION or mode == GameMode.REWARD_CHOICE:
 		return true
-	if mode == GameMode.EXPLORATION:
+	if _is_world_movement_mode():
 		return exploration_pending_combat or player_move_in_progress
 	return enemy_turn_in_progress or player_move_in_progress
 
@@ -620,6 +934,8 @@ func add_object(obj, tile: Vector2i) -> void:
 		obj.destroyed.connect(_on_environment_object_destroyed)
 	if obj.has_signal("reward_requested") and not obj.reward_requested.is_connected(_on_reward_pickup_requested):
 		obj.reward_requested.connect(_on_reward_pickup_requested)
+	if obj.has_signal("replay_requested") and not obj.replay_requested.is_connected(_on_replay_tile_entered):
+		obj.replay_requested.connect(_on_replay_tile_entered)
 
 	if obj.get_parent() != self:
 		add_child(obj)
@@ -670,6 +986,70 @@ func _spawn_post_combat_reward_pickup() -> String:
 	return "A card reward appeared at the nearest free tile."
 
 
+func _spawn_replay_tile() -> String:
+	_remove_active_replay_tile()
+	if not _is_in_bounds(REPLAY_TILE_GRID_POSITION):
+		return "Replay tile position is out of bounds."
+
+	var replay_tile := ReplayTileScene.instantiate() as ReplayTile
+	if replay_tile == null:
+		return "Replay tile scene could not be created."
+
+	add_object(replay_tile, REPLAY_TILE_GRID_POSITION)
+	active_replay_tile = replay_tile
+	return "A replay tile appeared."
+
+
+func enter_post_combat_reward_state(recovered_exhausted_count: int = 0) -> void:
+	mode = GameMode.POST_COMBAT_REWARD
+	_pause_exploration_enemy_schedules(true)
+	_refresh_exploration_state()
+
+	message = _consume_environment_messages("")
+	if recovered_exhausted_count > 0:
+		var recovered_text := "Recovered %d exhausted card(s)." % recovered_exhausted_count
+		message = recovered_text if message.is_empty() else "%s %s" % [message, recovered_text]
+
+	var reward_text := _spawn_post_combat_reward_pickup()
+	if not reward_text.is_empty():
+		message = reward_text if message.is_empty() else "%s %s" % [message, reward_text]
+
+	var replay_text := _spawn_replay_tile()
+	if not replay_text.is_empty():
+		message = replay_text if message.is_empty() else "%s %s" % [message, replay_text]
+
+	_refresh_ui()
+	queue_redraw()
+
+
+func clear_post_combat_reward_state(remove_reward_pickup: bool = false) -> void:
+	_remove_active_replay_tile()
+	if remove_reward_pickup and active_reward_pickup != null and is_instance_valid(active_reward_pickup):
+		consume_map_pickup(active_reward_pickup)
+	active_reward_pickup = null
+	if mode == GameMode.POST_COMBAT_REWARD:
+		mode = GameMode.EXPLORATION
+
+
+func _remove_active_replay_tile() -> void:
+	if active_replay_tile == null:
+		return
+	if is_instance_valid(active_replay_tile):
+		active_replay_tile.disable()
+		consume_map_pickup(active_replay_tile)
+	active_replay_tile = null
+
+
+func _on_replay_tile_entered(_tile: Vector2i) -> void:
+	if replay_reset_in_progress:
+		return
+	if mode != GameMode.POST_COMBAT_REWARD:
+		return
+	if active_replay_tile != null and is_instance_valid(active_replay_tile):
+		active_replay_tile.disable()
+	reset_level_to_initial_state()
+
+
 func _find_reward_pickup_spawn_tile(origin: Vector2i) -> Vector2i:
 	for direction in CARDINAL_DIRECTIONS:
 		var candidate := origin + direction
@@ -712,9 +1092,12 @@ func _on_reward_pickup_requested(pickup: RewardPickup, reward_options: Array) ->
 func _open_reward_choice(options: Array[Dictionary], source_pickup: RewardPickup = null) -> void:
 	if options.is_empty():
 		return
-	if mode != GameMode.EXPLORATION:
+	if not _is_world_movement_mode():
+		return
+	if replay_reset_in_progress:
 		return
 
+	reward_choice_return_mode = mode
 	active_reward_pickup = source_pickup
 	active_reward_options = options.duplicate(true)
 	_clear_pending_directional_card(false)
@@ -730,17 +1113,26 @@ func _open_reward_choice(options: Array[Dictionary], source_pickup: RewardPickup
 func _on_reward_confirmed(reward: Dictionary) -> void:
 	if mode != GameMode.REWARD_CHOICE:
 		return
+	if replay_reset_in_progress:
+		return
 
 	var reward_name := String(reward.get("name", "reward"))
+	var returned_from_post_combat := reward_choice_return_mode == GameMode.POST_COMBAT_REWARD
 	if not _apply_reward(reward):
 		message = "Could not apply %s." % reward_name
 		_close_reward_choice()
-		_restore_exploration_after_reward()
+		if returned_from_post_combat:
+			_restore_post_combat_after_reward()
+		else:
+			_restore_exploration_after_reward()
 		return
 
 	_consume_active_reward_pickup()
 	_close_reward_choice()
-	_restore_exploration_after_reward()
+	if returned_from_post_combat:
+		_restore_post_combat_after_reward()
+	else:
+		_restore_exploration_after_reward()
 
 	if must_resolve_overflow:
 		message = "Added %s to your deck and hand. Hand overflow: play or discard a card." % reward_name
@@ -783,11 +1175,18 @@ func _close_reward_choice() -> void:
 	if reward_choice_ui != null:
 		reward_choice_ui.hide()
 	active_reward_options.clear()
+	reward_choice_return_mode = GameMode.EXPLORATION
 
 
 func _restore_exploration_after_reward() -> void:
 	mode = GameMode.EXPLORATION
 	_pause_exploration_enemy_schedules(false)
+	_refresh_exploration_state()
+
+
+func _restore_post_combat_after_reward() -> void:
+	mode = GameMode.POST_COMBAT_REWARD
+	_pause_exploration_enemy_schedules(true)
 	_refresh_exploration_state()
 
 
@@ -869,7 +1268,7 @@ func _process(_delta: float) -> void:
 		_update_message()
 		return
 	
-	if mode == GameMode.EXPLORATION:
+	if _is_world_movement_mode():
 		_try_exploration_move(move_dir)
 	elif mode == GameMode.COMBAT:
 		_try_combat_move(move_dir)
@@ -967,6 +1366,10 @@ func _resolve_player_manual_move_action(direction: Vector2i) -> Dictionary:
 		result["success"] = true
 		result["moved_distance"] = int(result["moved_distance"]) + 1
 		result["ended_tile"] = player.grid_position
+		if replay_reset_completed_this_step:
+			result["triggered_level_reset"] = true
+			replay_reset_completed_this_step = false
+			break
 
 		if player.hp <= 0 or mode == GameMode.DEFEAT:
 			break
@@ -984,7 +1387,11 @@ func _try_exploration_move(direction: Vector2i) -> void:
 	var move_result := await _resolve_player_manual_move_action(direction)
 	if not bool(move_result.get("success", false)):
 		return
-	if mode != GameMode.EXPLORATION:
+	if bool(move_result.get("triggered_level_reset", false)):
+		_refresh_ui()
+		queue_redraw()
+		return
+	if not _is_world_movement_mode():
 		return
 
 	var resolved_message := _consume_environment_messages("Moved to %s." % [str(player.grid_position)])
@@ -1041,7 +1448,7 @@ func _is_tile_walkable(
 	if obj != null and obj != moving_entity and obj != ignored_blocker and bool(obj.blocks_movement) and not ignore_object_blocking:
 		return false
 
-	if mode == GameMode.EXPLORATION and _is_tile_reserved_by_other(tile, moving_entity):
+	if _is_world_movement_mode() and _is_tile_reserved_by_other(tile, moving_entity):
 		return false
 
 	if treat_player_as_blocked and player != moving_entity and player != ignored_blocker and player.grid_position == tile:
@@ -1714,6 +2121,10 @@ func _move_player_one_tile(target: Vector2i, move_rules: Dictionary = {}) -> boo
 	exploration_active_presentations = max(exploration_active_presentations - 1, 0)
 	_clear_exploration_reservations_for(player)
 	_resolve_entity_tile_entry(player, apply_hazards, apply_tile_triggers)
+	if replay_reset_completed_this_step:
+		player_move_in_progress = false
+		_refresh_exploration_state()
+		return true
 	if mode == GameMode.REWARD_CHOICE:
 		player_move_in_progress = false
 		_refresh_exploration_state()
@@ -2307,10 +2718,15 @@ func _check_end_of_combat() -> void:
 		return
 	if resolving_player_card:
 		return
-	var was_combat_active := mode == GameMode.COMBAT or mode == GameMode.COMBAT_TRANSITION
+	if mode != GameMode.COMBAT and mode != GameMode.COMBAT_TRANSITION:
+		return
+	on_combat_won()
+
+
+func on_combat_won() -> void:
 	var recovered_exhausted_count := deck_manager.recover_exhausted_cards()
 	_clear_pending_directional_card(false)
-	mode = GameMode.EXPLORATION
+	_clear_combat_runtime_state()
 	exploration_pending_combat = false
 	exploration_combat_trigger_enemy = null
 	exploration_combat_trigger_reason = ""
@@ -2318,19 +2734,9 @@ func _check_end_of_combat() -> void:
 	combat_transition_can_start = false
 	suppress_next_move_input = false
 	exploration_reserved_tiles.clear()
-	_pause_exploration_enemy_schedules(false)
 	_set_current_target(null)
 	_rebuild_enemy_threat_map()
-	_refresh_exploration_state()
-	message = _consume_environment_messages("")
-	if recovered_exhausted_count > 0:
-		var recovered_text := "Recovered %d exhausted card(s)." % recovered_exhausted_count
-		message = recovered_text if message.is_empty() else "%s %s" % [message, recovered_text]
-	if was_combat_active:
-		var reward_text := _spawn_post_combat_reward_pickup()
-		if not reward_text.is_empty():
-			message = reward_text if message.is_empty() else "%s %s" % [message, reward_text]
-	_update_message()
+	enter_post_combat_reward_state(recovered_exhausted_count)
 
 
 func _update_enemy_intent(e: Enemy) -> void:
@@ -2460,6 +2866,12 @@ func _controls_text() -> String:
 					return "Transitioning to combat."
 				_:
 					return "Explore with arrow keys/WASD. Press . or X to wait. Number keys can play any usable card."
+		GameMode.POST_COMBAT_REWARD:
+			if player_move_in_progress:
+				return "Resolving your movement."
+			if active_reward_pickup != null and is_instance_valid(active_reward_pickup):
+				return "Choose the card reward, or step onto the gold replay tile to reset the room."
+			return "Step onto the gold replay tile to reset the room."
 		GameMode.COMBAT_TRANSITION:
 			if combat_transition_can_start:
 				return "Combat is ready. Press any key or click to begin."
@@ -2485,6 +2897,8 @@ func _mode_name() -> String:
 	match mode:
 		GameMode.EXPLORATION:
 			return "Exploration"
+		GameMode.POST_COMBAT_REWARD:
+			return "Post Combat Reward"
 		GameMode.COMBAT_TRANSITION:
 			return "Combat Transition"
 		GameMode.COMBAT:
