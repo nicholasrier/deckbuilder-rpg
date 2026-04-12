@@ -56,6 +56,15 @@ layout_mode = 2
 text = "Move with arrow keys or WASD."
 horizontal_alignment = 1
 
+[node name="EndTurnContainer" type="CenterContainer" parent="CanvasLayer/HUD/Root"]
+visible = false
+layout_mode = 2
+
+[node name="EndTurnButton" type="Button" parent="CanvasLayer/HUD/Root/EndTurnContainer"]
+custom_minimum_size = Vector2(220, 64)
+layout_mode = 2
+text = "End Turn"
+
 [node name="HandPanel" type="PanelContainer" parent="CanvasLayer/HUD/Root"]
 layout_mode = 2
 size_flags_horizontal = 3
@@ -74,5 +83,5 @@ alignment = 1
 
 [node name="ControlsLabel" type="Label" parent="CanvasLayer/HUD/Root"]
 layout_mode = 2
-text = "Arrow keys/WASD move. Number keys play cards. Space ends turn."
+text = "Arrow keys/WASD move. Number keys play cards. Space or End Turn ends turn."
 horizontal_alignment = 1

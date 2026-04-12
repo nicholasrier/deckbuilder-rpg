@@ -85,6 +85,8 @@ enum ExplorationState {
 @onready var stats_label: Label = $CanvasLayer/HUD/Root/TopBar/StatsLabel
 @onready var combat_banner: Label = $CanvasLayer/HUD/Root/CombatBanner
 @onready var center_message: Label = $CanvasLayer/HUD/Root/CenterMessage
+@onready var end_turn_container: CenterContainer = $CanvasLayer/HUD/Root/EndTurnContainer
+@onready var end_turn_button: Button = $CanvasLayer/HUD/Root/EndTurnContainer/EndTurnButton
 @onready var hand_box: HBoxContainer = $CanvasLayer/HUD/Root/HandPanel/HandMargin/HandBox
 @onready var controls_label: Label = $CanvasLayer/HUD/Root/ControlsLabel
 
@@ -289,6 +291,7 @@ func _on_environment_object_destroyed(obj) -> void:
 func _ready() -> void:
 	_setup_input_map()
 	_setup_reward_choice_ui()
+	end_turn_button.pressed.connect(_on_end_turn_button_pressed)
 	_setup_environment_layers()
 	var patrol_enemy := _spawn_enemy(EnemyScene, Vector2i(6, 3))
 	patrol_enemy.exploration_cadence = 0.85
@@ -792,6 +795,9 @@ func _is_pointer_over_card_ui() -> bool:
 
 
 func _is_pointer_over_card_ui_at(screen_pos: Vector2) -> bool:
+	if end_turn_container.visible and end_turn_button.get_global_rect().has_point(screen_pos):
+		return true
+
 	if hand_box.get_global_rect().has_point(screen_pos):
 		return true
 
@@ -827,8 +833,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 
 	if event.is_action_pressed("end_turn"):
-		if mode == GameMode.COMBAT and not must_resolve_overflow:
-			_end_player_turn()
+		_handle_end_turn_request()
 		return
 	if event.is_action_pressed("card_1"):
 		_handle_card_shortcut(0)
@@ -2501,6 +2506,21 @@ func _end_player_turn() -> void:
 	_update_message()
 
 
+func _handle_end_turn_request() -> void:
+	if _is_input_locked():
+		return
+	if _has_pending_directional_card():
+		message = "Choose a cardinal throw direction for %s." % pending_directional_card.get("name", "this card")
+		_update_message()
+		return
+	if mode == GameMode.COMBAT and not must_resolve_overflow:
+		_end_player_turn()
+
+
+func _on_end_turn_button_pressed() -> void:
+	_handle_end_turn_request()
+
+
 func _get_enemy_combat_turn_order() -> Array[Enemy]:
 	var ordered_enemies: Array[Enemy] = []
 
@@ -3073,6 +3093,8 @@ func _refresh_ui() -> void:
 		max_energy
 	]
 	combat_banner.visible = mode == GameMode.COMBAT_TRANSITION
+	end_turn_container.visible = _should_show_end_turn_button()
+	end_turn_button.disabled = _should_disable_end_turn_button()
 	controls_label.text = _controls_text()
 	_rebuild_hand()
 	_update_message()
@@ -3098,6 +3120,18 @@ func _should_disable_hand_buttons() -> bool:
 		or mode == GameMode.VICTORY \
 		or _is_input_locked() \
 		or _has_pending_directional_card()
+
+
+func _should_show_end_turn_button() -> bool:
+	return mode == GameMode.COMBAT
+
+
+func _should_disable_end_turn_button() -> bool:
+	if mode != GameMode.COMBAT:
+		return true
+	if _is_input_locked():
+		return true
+	return must_resolve_overflow
 
 
 func _update_hand_button_disabled_states() -> void:
@@ -3157,8 +3191,8 @@ func _controls_text() -> String:
 			if player_move_in_progress:
 				return "Movement in progress."
 			if must_resolve_overflow:
-				return "Hand overflow: press 1-5 or click a card to discard it. Space is locked."
-			return "Combat: arrow keys/WASD or click/tap a legal tile to move, 1-5 play cards, Space ends turn."
+				return "Hand overflow: press 1-5 or click a card to discard it. End turn is locked."
+			return "Combat: arrow keys/WASD or click/tap a legal tile to move, 1-5 play cards, Space or End Turn ends turn."
 		GameMode.REWARD_CHOICE:
 			return "Choose a reward. Click a card, then click it again or press Y. Press N to cancel selection."
 		GameMode.VICTORY:
