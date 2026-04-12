@@ -129,6 +129,7 @@ var initial_level_snapshot: Dictionary = {}
 var active_replay_tile: ReplayTile = null
 var replay_reset_in_progress := false
 var replay_reset_completed_this_step := false
+var interrupt_player_path_after_step := false
 
 
 func mark_threat_tile(tile: Vector2i) -> void:
@@ -137,6 +138,16 @@ func mark_threat_tile(tile: Vector2i) -> void:
 
 func clear_threat_tiles() -> void:
 	threatened_tiles.clear()
+
+
+func _request_player_path_interrupt() -> void:
+	interrupt_player_path_after_step = true
+
+
+func _consume_player_path_interrupt() -> bool:
+	var should_interrupt := interrupt_player_path_after_step
+	interrupt_player_path_after_step = false
+	return should_interrupt
 
 
 func is_tile_threatened(tile: Vector2i) -> bool:
@@ -511,6 +522,7 @@ func _clear_exploration_runtime_state() -> void:
 	combat_transition_running = false
 	combat_transition_can_start = false
 	suppress_next_move_input = false
+	interrupt_player_path_after_step = false
 	pending_environment_messages.clear()
 	_set_exploration_state(ExplorationState.WAITING_FOR_PLAYER_INPUT)
 
@@ -759,32 +771,32 @@ func _input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 		return
 
-	if event is InputEventMouseButton \
-	and event.button_index == MOUSE_BUTTON_LEFT \
-	and event.pressed:
-		if _is_pointer_over_card_ui():
-			return
+	if not _is_world_pointer_select_event(event):
+		return
 
-		var world_pos := get_global_mouse_position()
-		var clicked_tile := _world_to_grid(world_pos)
-		if not _is_in_bounds(clicked_tile):
-			return
+	var screen_pos := _get_world_pointer_screen_position(event)
+	if _is_pointer_over_card_ui_at(screen_pos):
+		return
 
-		if _has_pending_directional_card():
-			_handle_directional_projectile_click(clicked_tile)
-			return
+	var world_pos := _screen_to_world(screen_pos)
+	var clicked_tile := _world_to_grid(world_pos)
+	if not _is_in_bounds(clicked_tile):
+		return
 
-		var clicked_targetable: Node2D = _get_targetable_at_world_pos(world_pos)
-		_set_current_target(clicked_targetable)
+	if _handle_world_tile_interaction(clicked_tile):
+		get_viewport().set_input_as_handled()
 
 
 func _is_pointer_over_card_ui() -> bool:
-	var mouse_pos := get_viewport().get_mouse_position()
-	if hand_box.get_global_rect().has_point(mouse_pos):
+	return _is_pointer_over_card_ui_at(get_viewport().get_mouse_position())
+
+
+func _is_pointer_over_card_ui_at(screen_pos: Vector2) -> bool:
+	if hand_box.get_global_rect().has_point(screen_pos):
 		return true
 
 	for child in hand_box.get_children():
-		if child is Control and child.get_global_rect().has_point(mouse_pos):
+		if child is Control and child.get_global_rect().has_point(screen_pos):
 			return true
 
 	return false
@@ -847,6 +859,8 @@ func _is_combat_transition_confirm_event(event: InputEvent) -> bool:
 		return event.pressed and not event.echo
 	if event is InputEventMouseButton:
 		return event.pressed
+	if event is InputEventScreenTouch:
+		return event.pressed
 	return false
 
 
@@ -854,9 +868,42 @@ func _world_to_grid(world_pos: Vector2) -> Vector2i:
 	return Vector2i(world_pos / TILE_SIZE)
 
 
+func _screen_to_world(screen_pos: Vector2) -> Vector2:
+	return get_viewport().get_canvas_transform().affine_inverse() * screen_pos
+
+
+func _is_world_pointer_select_event(event: InputEvent) -> bool:
+	if event is InputEventMouseButton:
+		return event.button_index == MOUSE_BUTTON_LEFT and event.pressed
+	if event is InputEventScreenTouch:
+		return event.pressed
+	return false
+
+
+func _get_world_pointer_screen_position(event: InputEvent) -> Vector2:
+	if event is InputEventMouseButton:
+		return event.position
+	if event is InputEventScreenTouch:
+		return event.position
+	return Vector2.ZERO
+
+
 func _get_targetable_at_world_pos(world_pos: Vector2):
 	var grid_pos := _world_to_grid(world_pos)
 	return get_targetable_at(grid_pos)
+
+
+func _handle_world_tile_interaction(clicked_tile: Vector2i) -> bool:
+	if _has_pending_directional_card():
+		_handle_directional_projectile_click(clicked_tile)
+		return true
+
+	var clicked_targetable := get_targetable_at(clicked_tile) as Node2D
+	if clicked_targetable != null:
+		_set_current_target(clicked_targetable)
+		return true
+
+	return _request_player_tile_move(clicked_tile)
 
 
 func get_enemy_at(tile: Vector2i) -> Enemy:
@@ -1324,6 +1371,7 @@ func _read_move_input() -> Vector2i:
 
 
 func _resolve_player_manual_move_action(direction: Vector2i) -> Dictionary:
+	interrupt_player_path_after_step = false
 	var step_direction := direction.sign()
 	var move_effect := _consume_next_manual_move_effect()
 	var attempted_distance := 1 + int(move_effect.get("bonus_distance", 0))
@@ -1369,6 +1417,9 @@ func _resolve_player_manual_move_action(direction: Vector2i) -> Dictionary:
 		if replay_reset_completed_this_step:
 			result["triggered_level_reset"] = true
 			replay_reset_completed_this_step = false
+			break
+		if _consume_player_path_interrupt():
+			result["interrupted"] = true
 			break
 
 		if player.hp <= 0 or mode == GameMode.DEFEAT:
@@ -1480,6 +1531,21 @@ func _get_attack_goal_tiles(target_tile: Vector2i, attack_offsets: Array[Vector2
 	return goal_tiles
 
 
+func _get_path_step_hazard_cost(tile: Vector2i, goal_tile: Vector2i) -> int:
+	if get_hazard_at(tile).is_empty():
+		return 0
+	if tile == goal_tile and not get_hazard_at(goal_tile).is_empty():
+		return 0
+	return 1
+
+
+func _count_path_hazards(path: Array[Vector2i], goal_tile: Vector2i) -> int:
+	var hazard_count := 0
+	for step_tile in path:
+		hazard_count += _get_path_step_hazard_cost(step_tile, goal_tile)
+	return hazard_count
+
+
 func _find_bfs_path(
 	start_tile: Vector2i,
 	goal_tile: Vector2i,
@@ -1501,20 +1567,22 @@ func _find_bfs_path(
 	):
 		return path
 
-	var came_from: Dictionary = {start_tile: start_tile}
+	var distances: Dictionary = {start_tile: 0}
 	var frontier: Array[Vector2i] = [start_tile]
+	var tiles_by_distance: Dictionary = {0: [start_tile]}
 	var frontier_index := 0
 
 	while frontier_index < frontier.size():
-		var current := frontier[frontier_index]
+		var current: Vector2i = frontier[frontier_index]
 		frontier_index += 1
 
 		if current == goal_tile:
 			break
 
+		var current_distance: int = int(distances.get(current, 0))
 		for direction in CARDINAL_DIRECTIONS:
 			var next_tile := current + direction
-			if came_from.has(next_tile):
+			if distances.has(next_tile):
 				continue
 			if not _is_tile_walkable(
 				next_tile,
@@ -1526,8 +1594,38 @@ func _find_bfs_path(
 			):
 				continue
 
-			came_from[next_tile] = current
+			var next_distance := current_distance + 1
+			distances[next_tile] = next_distance
 			frontier.append(next_tile)
+			if not tiles_by_distance.has(next_distance):
+				tiles_by_distance[next_distance] = []
+			var layer: Array = tiles_by_distance[next_distance]
+			layer.append(next_tile)
+			tiles_by_distance[next_distance] = layer
+			
+	if not distances.has(goal_tile):
+		return path
+
+	var goal_distance: int = int(distances.get(goal_tile, 0))
+	var came_from: Dictionary = {start_tile: start_tile}
+	var best_hazard_counts: Dictionary = {start_tile: 0}
+
+	for distance in range(goal_distance):
+		var layer: Array = tiles_by_distance.get(distance, [])
+		for raw_current in layer:
+			var current: Vector2i = raw_current
+			if not best_hazard_counts.has(current):
+				continue
+			var current_hazard_count: int = int(best_hazard_counts.get(current, 0))
+			for direction in CARDINAL_DIRECTIONS:
+				var next_tile := current + direction
+				if int(distances.get(next_tile, -1)) != distance + 1:
+					continue
+
+				var next_hazard_count := current_hazard_count + _get_path_step_hazard_cost(next_tile, goal_tile)
+				if not best_hazard_counts.has(next_tile) or next_hazard_count < int(best_hazard_counts.get(next_tile, 0)):
+					best_hazard_counts[next_tile] = next_hazard_count
+					came_from[next_tile] = current
 
 	if not came_from.has(goal_tile):
 		return path
@@ -1549,6 +1647,7 @@ func _find_path_to_nearest_goal(
 	ignore_destructible_objects: bool = false
 ) -> Array[Vector2i]:
 	var best_path: Array[Vector2i] = []
+	var best_hazard_count := 0
 	var found_path := false
 
 	for goal_tile in goal_tiles:
@@ -1562,8 +1661,12 @@ func _find_path_to_nearest_goal(
 		)
 		if path.is_empty():
 			continue
-		if not found_path or path.size() < best_path.size():
+		var hazard_count := _count_path_hazards(path, goal_tile)
+		if not found_path \
+		or path.size() < best_path.size() \
+		or (path.size() == best_path.size() and hazard_count < best_hazard_count):
 			best_path = path
+			best_hazard_count = hazard_count
 			found_path = true
 
 	return best_path
@@ -1611,6 +1714,183 @@ func _find_enemy_path_to_target(
 		log_debug,
 		ignore_destructible_objects
 	)
+
+
+func _get_actor_movement_allowance(actor) -> int:
+	if actor == player:
+		return movement_left
+	if actor is Enemy:
+		return actor.get_movement_allowance()
+	return 0
+
+
+func _get_actor_available_energy(actor) -> int:
+	if actor == player:
+		return current_energy
+	if actor is Enemy:
+		return actor.current_energy
+	return 0
+
+
+func _get_actor_movement_energy_cost(actor, tiles: int = 1) -> int:
+	var tile_count = max(tiles, 0)
+	if actor == player:
+		return tile_count
+	if actor is Enemy:
+		return actor.get_movement_energy_cost(tile_count)
+	return -1
+
+
+func _get_actor_affordable_movement_steps(actor, requested_steps: int = -1) -> int:
+	if actor == null or not is_instance_valid(actor):
+		return 0
+
+	var move_cost := _get_actor_movement_energy_cost(actor)
+	if move_cost <= 0:
+		return 0
+
+	var affordable_steps := int(floor(float(_get_actor_available_energy(actor)) / float(move_cost)))
+	var allowed_steps = min(_get_actor_movement_allowance(actor), affordable_steps)
+	if requested_steps >= 0:
+		allowed_steps = min(allowed_steps, requested_steps)
+	return max(allowed_steps, 0)
+
+
+func _spend_actor_movement_cost(actor, tiles: int) -> bool:
+	var tile_count = max(tiles, 0)
+	if tile_count <= 0:
+		return true
+
+	if actor == player:
+		if current_energy < tile_count or movement_left < tile_count:
+			return false
+		current_energy -= tile_count
+		movement_left -= tile_count
+		return true
+
+	if actor is Enemy:
+		return actor.spend_energy(_get_actor_movement_energy_cost(actor, tile_count))
+
+	return false
+
+
+func _build_player_tile_move_request(destination: Vector2i) -> Dictionary:
+	var request: Dictionary = {
+		"legal": false,
+		"path": [],
+		"destination": destination,
+		"mode": mode
+	}
+	if player == null or not is_instance_valid(player):
+		return request
+	if player_move_in_progress or destination == player.grid_position:
+		return request
+	if must_resolve_overflow:
+		return request
+
+	var path := _find_bfs_path(player.grid_position, destination, player, true, true)
+	if path.is_empty():
+		return request
+	request["path"] = path
+
+	if mode == GameMode.COMBAT:
+		var path_length := path.size()
+		request["legal"] = _get_actor_affordable_movement_steps(player, path_length) >= path_length
+		return request
+
+	request["legal"] = _is_world_movement_mode()
+	return request
+
+
+func _request_player_tile_move(destination: Vector2i) -> bool:
+	if mode != GameMode.COMBAT and not _is_world_movement_mode():
+		return false
+
+	var move_request := _build_player_tile_move_request(destination)
+	if not bool(move_request.get("legal", false)):
+		return false
+
+	_resolve_player_tile_move_request(move_request)
+	return true
+
+
+func _resolve_player_tile_move_request(move_request: Dictionary) -> void:
+	var path := _copy_vector2i_array(move_request.get("path", []))
+	if path.is_empty():
+		return
+
+	var in_combat := int(move_request.get("mode", mode)) == GameMode.COMBAT
+	var move_result := await _execute_player_path(path, in_combat)
+	if int(move_result.get("moved_steps", 0)) <= 0:
+		return
+	if bool(move_result.get("triggered_level_reset", false)):
+		_refresh_ui()
+		queue_redraw()
+		return
+
+	if in_combat:
+		if mode != GameMode.COMBAT:
+			_refresh_ui()
+			queue_redraw()
+			return
+		message = _consume_environment_messages("Moved to %s." % [str(player.grid_position)])
+		_update_all_enemy_intent()
+		_refresh_ui()
+		queue_redraw()
+		return
+
+	if not _is_world_movement_mode():
+		return
+
+	var resolved_message := _consume_environment_messages("Moved to %s." % [str(player.grid_position)])
+	if not resolved_message.is_empty():
+		message = resolved_message
+	_refresh_ui()
+	queue_redraw()
+
+
+func _execute_player_path(path: Array[Vector2i], spend_combat_resources: bool = false) -> Dictionary:
+	var result: Dictionary = {
+		"moved_steps": 0,
+		"triggered_level_reset": false,
+		"interrupted": false
+	}
+	if path.is_empty():
+		return result
+	interrupt_player_path_after_step = false
+
+	for next_tile in path:
+		if spend_combat_resources and _get_actor_affordable_movement_steps(player, 1) <= 0:
+			result["interrupted"] = true
+			break
+		if not await _move_player_one_tile(next_tile):
+			result["interrupted"] = true
+			break
+
+		result["moved_steps"] = int(result["moved_steps"]) + 1
+		if spend_combat_resources and not _spend_actor_movement_cost(player, 1):
+			result["interrupted"] = true
+			break
+
+		if replay_reset_completed_this_step:
+			result["triggered_level_reset"] = true
+			replay_reset_completed_this_step = false
+			break
+		if _consume_player_path_interrupt():
+			result["interrupted"] = true
+			break
+		if player.hp <= 0 or mode == GameMode.DEFEAT:
+			result["interrupted"] = true
+			break
+		if spend_combat_resources:
+			if mode != GameMode.COMBAT:
+				result["interrupted"] = true
+				break
+		elif not _is_world_movement_mode():
+			result["interrupted"] = true
+			break
+
+	return result
 
 
 func _grid_to_world_center(tile: Vector2i) -> Vector2:
@@ -1730,20 +2010,15 @@ func _move_enemy_with_energy_budget(enemy: Enemy, path: Array[Vector2i], movemen
 	if movement_allowance <= 0 or path.is_empty():
 		return 0
 
-	var move_cost := enemy.get_movement_energy_cost()
-	if move_cost <= 0:
+	var allowed_steps := _get_actor_affordable_movement_steps(enemy, movement_allowance)
+	if allowed_steps <= 0:
 		return 0
 
-	var affordable_steps := int(floor(float(enemy.current_energy) / float(move_cost)))
-	if affordable_steps <= 0:
-		return 0
-
-	var allowed_steps: int = min(movement_allowance, affordable_steps)
 	var moved_steps := await _move_enemy_along_path(enemy, path, allowed_steps)
 	if moved_steps <= 0:
 		return 0
 
-	enemy.spend_energy(enemy.get_movement_energy_cost(moved_steps))
+	_spend_actor_movement_cost(enemy, moved_steps)
 	return moved_steps
 
 
@@ -2865,7 +3140,7 @@ func _controls_text() -> String:
 				ExplorationState.TRANSITIONING_TO_COMBAT:
 					return "Transitioning to combat."
 				_:
-					return "Explore with arrow keys/WASD. Press . or X to wait. Number keys can play any usable card."
+					return "Explore with arrow keys/WASD or click/tap a tile. Press . or X to wait. Number keys can play any usable card."
 		GameMode.POST_COMBAT_REWARD:
 			if player_move_in_progress:
 				return "Resolving your movement."
@@ -2883,7 +3158,7 @@ func _controls_text() -> String:
 				return "Movement in progress."
 			if must_resolve_overflow:
 				return "Hand overflow: press 1-5 or click a card to discard it. Space is locked."
-			return "Combat: arrow keys/WASD move for 1 energy, 1-5 play cards, Space ends turn."
+			return "Combat: arrow keys/WASD or click/tap a legal tile to move, 1-5 play cards, Space ends turn."
 		GameMode.REWARD_CHOICE:
 			return "Choose a reward. Click a card, then click it again or press Y. Press N to cancel selection."
 		GameMode.VICTORY:
@@ -2966,6 +3241,7 @@ func resolve_draw_pickup(draw_count: int) -> void:
 	else:
 		pending_environment_messages.append("Draw %d pickup triggered." % draw_count)
 
+	_request_player_path_interrupt()
 	if must_resolve_overflow:
 		pending_environment_messages.append("Hand overflow: play or discard a card.")
 
